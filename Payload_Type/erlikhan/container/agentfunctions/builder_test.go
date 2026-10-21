@@ -15,7 +15,7 @@ import (
 
 func testBuildParams() *agentstructs.BuildParameters {
 	p := map[string]any{}
-	for _, b := range []string{"garble", "console", "obfu_strings", "obfu_deadcode", "obfu_opaque", "obfu_mba", "obfu_controlflow", "obfu_winapi", "strip", "rename_sections", "pe_stomp", "sanitize", "iso_autorun"} {
+	for _, b := range []string{"garble", "console", "obfu_strings", "obfu_deadcode", "obfu_opaque", "obfu_mba", "obfu_controlflow", "obfu_winapi", "strip", "rename_sections", "pe_stomp", "sanitize", "iso_autorun", "shellcode"} {
 		p[b] = false
 	}
 	p["garble_profile"] = "random"
@@ -163,9 +163,24 @@ func TestParseBuildParams(t *testing.T) {
 	}
 	if opts.garble || opts.console || opts.arch != "AMD_x64" || opts.compiler != "go" || opts.versioninfo != "spoof" ||
 		opts.spoofName != "cmd" || opts.goeditor != "basic" || opts.pack != "none" ||
-		opts.sign != "none" || opts.retries != 3 || opts.taskingSize != -1 || opts.packaging != "none" {
+		opts.sign != "none" || opts.retries != 3 || opts.taskingSize != -1 || opts.packaging != "none" || opts.shellcode {
 		t.Fatalf("defaults mismatch: %+v", opts)
 	}
+}
+
+func TestDonutArch(t *testing.T) {
+	if donutArch("AMD_x64") != "2" || donutArch("x86") != "1" {
+		t.Fatal("donut arch mapping wrong")
+	}
+}
+
+func TestPayloadCanBeWrapped(t *testing.T) {
+	for _, w := range payloadDefinition.CanBeWrappedByTheFollowingPayloadTypes {
+		if w == "service_wrapper" {
+			return
+		}
+	}
+	t.Fatalf("service_wrapper not declared: %v", payloadDefinition.CanBeWrappedByTheFollowingPayloadTypes)
 }
 
 func TestParseBuildParamsRejects(t *testing.T) {
@@ -189,6 +204,8 @@ func TestParseBuildParamsRejects(t *testing.T) {
 		{"bad retries", map[string]any{"retries": 0.0}, nil, "retries"},
 		{"bad package", map[string]any{"package": "tar"}, nil, "package"},
 		{"autorun needs iso", map[string]any{"iso_autorun": true}, nil, "iso_autorun"},
+		{"shellcode needs package none", map[string]any{"shellcode": true, "package": "zip"}, nil, "package=none"},
+		{"shellcode needs sign none", map[string]any{"shellcode": true, "sign": "self", "sign_domain": "x.example"}, nil, "sign=none"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -577,6 +594,34 @@ func TestBuildCommandList(t *testing.T) {
 	}
 	if !strings.Contains(resp.BuildMessage, "builtin commands added") {
 		t.Fatalf("build should note added core commands: %q", resp.BuildMessage)
+	}
+}
+
+func TestBuildShellcode(t *testing.T) {
+	t.Setenv("ERLIKHAN_OFFLINE", "1")
+	for _, tool := range []string{"go", "donut"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not installed", tool)
+		}
+	}
+	testServiceRoot(t)
+	msg := testBuildMessage("none", "")
+	bp := testBuildParams()
+	bp.Parameters["shellcode"] = true
+	msg.BuildParameters = *bp
+	resp := build(msg)
+	if !resp.Success {
+		t.Fatalf("build failed: %s %s", resp.BuildMessage, resp.BuildStdErr)
+	}
+	if resp.Payload == nil || len(*resp.Payload) < 50000 {
+		t.Fatalf("shellcode suspiciously small: %d bytes", len(*resp.Payload))
+	}
+	// Raw shellcode: no MZ header, so service_wrapper accepts it.
+	if (*resp.Payload)[0] == 'M' && (*resp.Payload)[1] == 'Z' {
+		t.Fatal("shellcode output still has an MZ header")
+	}
+	if resp.UpdatedFilename == nil || !strings.HasSuffix(*resp.UpdatedFilename, ".bin") {
+		t.Fatalf("filename wrong: %v", resp.UpdatedFilename)
 	}
 }
 

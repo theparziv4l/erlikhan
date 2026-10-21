@@ -6,7 +6,7 @@ Erlikhan is a Mythic payload type. The agent talks to the `http`,
 `mqtt`, `dns`, and `msteams` C2 profiles, encrypts with the profile PSK
 (`aes256_hmac`) or plaintext (`none`), and implements `shell`,
 `powershell`, `sleep`, `ls`, `download`, `upload`, `rm`, `mkdir`,
-`exit`. The default build is a Go agent;
+`ps`, `kill`, `load`, `unload`, `exit`. The default build is a Go agent;
 `compiler=native` builds the small native C agent instead (zig cc,
 no Go runtime).
 
@@ -84,6 +84,7 @@ Every option that applies to an agent build is a build parameter:
 | clone_cert | File | — | Donor PE for cert clone |
 | retries | Number | 3 | Checkin attempts |
 | tasking_size | Number | -1 | Tasks per poll (-1 = all) |
+| shellcode | Boolean | false | Raw shellcode (.bin) via Donut; needs package=none, sign=none |
 | package | ChooseOne | none | none / zip / iso / img / vhd / 7z / msi |
 | package_password | String | — | 7z password |
 | msi_app_name | String | — | MSI product name |
@@ -115,12 +116,35 @@ signing, PE post-processing and packaging apply to both compilers.
 - `rm <path>` recursively deletes a file or directory tree and prunes
   it from the file browser.
 - `mkdir <path>` creates a directory with parents.
+- `ps` lists processes and populates the process browser. The Go
+  agent reports pid/ppid/name; the native C agent adds image path,
+  owner, integrity level and start time.
+- `kill <pid>` terminates a process.
+- `load <command>` / `unload <command>` enable or disable a command
+  on a live callback without rebuilding. All handlers stay compiled
+  in, so anything can be loaded back; `exit`, `load` and `unload`
+  themselves cannot be unloaded.
 - `exit` posts a final response and stops the agent.
+
+Executing commands report artifacts (process creation, file
+up/down/delete, process kill) to the artifacts view. New callbacks
+are stamped with an `erlikhan/<profile> · N commands` description and
+their sleep schedule.
 
 File transfers are chunked inside the task (512KB per chunk on `http`
 and `mqtt`, 8KB on `dns` and `msteams` where messages are small), so
 large files over `dns`/`msteams` are slow but work. The agent is
 single-host: file-browser `host` fields are ignored.
+
+## Shellcode output and wrappers
+
+With `shellcode=true` the build converts the finished EXE to raw
+position-independent shellcode (`<uuid>.bin`) with Donut, matching the
+build arch. Signing and packaging do not apply to shellcode output, so
+the build requires `sign=none` and `package=none` with it. The `.bin`
+is accepted by `service_wrapper` (select the built payload as the
+wrapped payload when creating the wrapper) and by external loaders
+such as ScareCrow.
 
 ## Adding or removing commands
 

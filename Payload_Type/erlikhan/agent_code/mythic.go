@@ -14,6 +14,9 @@ type Agent struct {
 	transport exchanger
 	interval  int
 	jitter    int
+	// post sends responses; handlers use it so transfers post chunks
+	// mid-task. Tests override it with a fake; nil means postResponses.
+	post poster
 }
 
 func newAgent(c Config) (*Agent, error) {
@@ -32,7 +35,17 @@ func newAgent(c Config) (*Agent, error) {
 	if interval < 0 {
 		interval = 0
 	}
-	return &Agent{cfg: c, uuid: c.PayloadUUID, psk: psk, transport: t, interval: interval, jitter: c.CallbackJitter}, nil
+	a := &Agent{cfg: c, uuid: c.PayloadUUID, psk: psk, transport: t, interval: interval, jitter: c.CallbackJitter}
+	a.post = a.postResponses
+	return a, nil
+}
+
+// posterFor returns the response poster, defaulting to the live one.
+func (a *Agent) posterFor() poster {
+	if a.post != nil {
+		return a.post
+	}
+	return a.postResponses
 }
 
 // chunkSize returns this callback's file-transfer chunk size.
@@ -123,7 +136,8 @@ func (a *Agent) getTasking() ([]Task, error) {
 
 // Response is one completed task result for post_response. The optional
 // keys drive Mythic core directly: file_browser populates the file tree,
-// removed_files prunes it, download/upload run chunked file transfers.
+// removed_files prunes it, download/upload run chunked file transfers,
+// processes feeds the process browser, artifacts files IOCs.
 type Response struct {
 	TaskID       string           `json:"task_id"`
 	UserOutput   string           `json:"user_output"`
@@ -133,6 +147,14 @@ type Response struct {
 	RemovedFiles *[]RemovedFile   `json:"removed_files,omitempty"`
 	Download     *DownloadPayload `json:"download,omitempty"`
 	Upload       *UploadPayload   `json:"upload,omitempty"`
+	Processes    *[]ProcessEntry  `json:"processes,omitempty"`
+	Artifacts    *[]Artifact      `json:"artifacts,omitempty"`
+}
+
+// Artifact is one IOC Mythic files from a task response.
+type Artifact struct {
+	BaseArtifact string `json:"base_artifact"`
+	Artifact     string `json:"artifact"`
 }
 
 // FilePerms is the permission metadata stored with a file tree entry.
@@ -167,6 +189,21 @@ type FileBrowser struct {
 // RemovedFile prunes one path from the file tree.
 type RemovedFile struct {
 	Path string `json:"path"`
+}
+
+// ProcessEntry is one row of a processes listing for the process browser.
+type ProcessEntry struct {
+	ProcessID       int    `json:"process_id"`
+	ParentProcessID int    `json:"parent_process_id"`
+	Architecture    string `json:"architecture,omitempty"`
+	BinPath         string `json:"bin_path,omitempty"`
+	Name            string `json:"name"`
+	User            string `json:"user,omitempty"`
+	CommandLine     string `json:"command_line,omitempty"`
+	IntegrityLevel  int    `json:"integrity_level,omitempty"`
+	StartTime       uint64 `json:"start_time,omitempty"`
+	Description     string `json:"description,omitempty"`
+	Signer          string `json:"signer,omitempty"`
 }
 
 // DownloadPayload carries one agent -> Mythic file chunk (1-based).

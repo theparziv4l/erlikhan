@@ -95,6 +95,17 @@ static void test_shell(agent_t *a) {
     run_task(a, "shell", "echo hi", &resp, &output, &exit_now);
     CHECK(strcmp(resp.status, "success") == 0, "shell status %s", resp.status);
     CHECK(resp.user_output && strstr(resp.user_output, "hi") != NULL, "shell output");
+    {
+        cJSON *wrap = resp.extra_json ? cJSON_Parse(resp.extra_json) : NULL;
+        cJSON *arr = wrap ? cJSON_GetObjectItemCaseSensitive(wrap, "artifacts") : NULL;
+        cJSON *one = arr ? cJSON_GetArrayItem(arr, 0) : NULL;
+        CHECK(one != NULL, "shell artifact");
+        if (one) {
+            CHECK(strcmp(json_str(one, "base_artifact"), "Process Create") == 0, "artifact base");
+            CHECK(strstr(json_str(one, "artifact"), "cmd.exe /c echo hi") != NULL, "artifact text");
+        }
+        cJSON_Delete(wrap);
+    }
     task_cleanup(&resp, &output);
 }
 
@@ -252,6 +263,11 @@ static void test_rm_mkdir(agent_t *a) {
     wrap = resp.extra_json ? cJSON_Parse(resp.extra_json) : NULL;
     arr = wrap ? cJSON_GetObjectItemCaseSensitive(wrap, "removed_files") : NULL;
     CHECK(arr && cJSON_IsArray(arr) && cJSON_GetArraySize(arr) == 1, "removed_files shape");
+    {
+        cJSON *arts = wrap ? cJSON_GetObjectItemCaseSensitive(wrap, "artifacts") : NULL;
+        cJSON *one = arts ? cJSON_GetArrayItem(arts, 0) : NULL;
+        CHECK(one && strcmp(json_str(one, "base_artifact"), "File Delete") == 0, "rm artifact");
+    }
     cJSON_Delete(wrap);
     task_cleanup(&resp, &output);
     CHECK(GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES, "tree gone");
@@ -289,8 +305,131 @@ static void test_transfer_errors(agent_t *a) {
     task_cleanup(&resp, &output);
 }
 
-int main(void) {
+static void test_ps_kill(agent_t *a) {
+    response_t resp;
+    char *output = NULL;
+    int exit_now = 0;
+    char mypid[32];
+    DWORD me = GetCurrentProcessId();
+    snprintf(mypid, sizeof(mypid), "%lu", (unsigned long)me);
+    if (!command_in_list(CFG_COMMANDS, "ps")) {
+        run_task(a, "ps", "", &resp, &output, &exit_now);
+        CHECK(resp.extra_json == NULL, "excluded ps");
+        task_cleanup(&resp, &output);
+    } else {
+        cJSON *wrap, *arr;
+        int i, found = 0, named = 0;
+        run_task(a, "ps", "", &resp, &output, &exit_now);
+        CHECK(strcmp(resp.status, "success") == 0, "ps status %s", resp.status);
+        CHECK(resp.user_output && strstr(resp.user_output, mypid) != NULL, "ps lists self");
+        CHECK(resp.extra_json != NULL, "ps fragment");
+        wrap = resp.extra_json ? cJSON_Parse(resp.extra_json) : NULL;
+        arr = wrap ? cJSON_GetObjectItemCaseSensitive(wrap, "processes") : NULL;
+        CHECK(arr && cJSON_IsArray(arr) && cJSON_GetArraySize(arr) > 0, "processes array");
+        if (arr) {
+            for (i = 0; i < cJSON_GetArraySize(arr); i++) {
+                cJSON *r = cJSON_GetArrayItem(arr, i);
+                if ((DWORD)json_num(r, "process_id") == me) {
+                    found = 1;
+                    if (json_str(r, "name")[0] != '\0')
+                        named = 1;
+                }
+            }
+        }
+        CHECK(found, "self in processes");
+        CHECK(named, "self named");
+        cJSON_Delete(wrap);
+        task_cleanup(&resp, &output);
+    }
+    if (!command_in_list(CFG_COMMANDS, "kill")) {
+        run_task(a, "kill", "1234", &resp, &output, &exit_now);
+        CHECK(resp.status && strstr(resp.status, "not included") != NULL, "kill excluded");
+        task_cleanup(&resp, &output);
+        return;
+    }
+    run_task(a, "kill", "abc", &resp, &output, &exit_now);
+    CHECK(resp.status && strstr(resp.status, "usage") != NULL, "kill abc, got %s",
+          resp.status ? resp.status : "(null)");
+    task_cleanup(&resp, &output);
+    run_task(a, "kill", "99999991", &resp, &output, &exit_now);
+    CHECK(resp.status && strstr(resp.status, "cannot open") != NULL, "kill missing, got %s",
+          resp.status ? resp.status : "(null)");
+    task_cleanup(&resp, &output);
+    {
+        char self[MAX_PATH], cmdline[MAX_PATH + 16], pidarg[32];
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        DWORD code = 0;
+        GetModuleFileNameA(NULL, self, sizeof(self));
+        snprintf(cmdline, sizeof(cmdline), "\"%s\" --hang", self);
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        memset(&pi, 0, sizeof(pi));
+        CHECK(CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi),
+              "spawn hang child");
+        if (pi.hProcess) {
+            snprintf(pidarg, sizeof(pidarg), "%lu", (unsigned long)pi.dwProcessId);
+            run_task(a, "kill", pidarg, &resp, &output, &exit_now);
+            CHECK(strcmp(resp.status, "success") == 0, "kill child %s", resp.status);
+            CHECK(resp.user_output && strstr(resp.user_output, pidarg) != NULL, "kill output");
+            {
+                cJSON *wrap = resp.extra_json ? cJSON_Parse(resp.extra_json) : NULL;
+                cJSON *arts = wrap ? cJSON_GetObjectItemCaseSensitive(wrap, "artifacts") : NULL;
+                cJSON *one = arts ? cJSON_GetArrayItem(arts, 0) : NULL;
+                CHECK(one && strcmp(json_str(one, "base_artifact"), "Process Kill") == 0,
+                      "kill artifact");
+                cJSON_Delete(wrap);
+            }
+            task_cleanup(&resp, &output);
+            CHECK(WaitForSingleObject(pi.hProcess, 10000) == WAIT_OBJECT_0, "child reaped");
+            GetExitCodeProcess(pi.hProcess, &code);
+            CHECK(code == 1, "child exit code %lu", (unsigned long)code);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+    }
+}
+
+static void test_load_unload(agent_t *a) {
+    response_t resp;
+    char *output = NULL;
+    int exit_now = 0;
+    if (!command_in_list(CFG_COMMANDS, "load")) {
+        run_task(a, "load", "sleep", &resp, &output, &exit_now);
+        CHECK(resp.status && strstr(resp.status, "not included") != NULL, "load excluded");
+        task_cleanup(&resp, &output);
+        return;
+    }
+    run_task(a, "unload", "sleep", &resp, &output, &exit_now);
+    CHECK(strcmp(resp.status, "success") == 0, "unload status %s", resp.status);
+    task_cleanup(&resp, &output);
+    run_task(a, "sleep", "5 10", &resp, &output, &exit_now);
+    CHECK(resp.status && strstr(resp.status, "not included") != NULL, "sleep unloaded, got %s",
+          resp.status ? resp.status : "(null)");
+    task_cleanup(&resp, &output);
+    run_task(a, "load", "sleep", &resp, &output, &exit_now);
+    CHECK(strcmp(resp.status, "success") == 0, "load status %s", resp.status);
+    task_cleanup(&resp, &output);
+    run_task(a, "sleep", "5 10", &resp, &output, &exit_now);
+    CHECK(strcmp(resp.status, "success") == 0, "sleep reloaded %s", resp.status);
+    CHECK(a->interval == 5 && a->jitter == 10, "sleep works after load");
+    task_cleanup(&resp, &output);
+    run_task(a, "unload", "exit", &resp, &output, &exit_now);
+    CHECK(resp.status && strstr(resp.status, "cannot unload") != NULL, "unload exit, got %s",
+          resp.status ? resp.status : "(null)");
+    task_cleanup(&resp, &output);
+    run_task(a, "load", "nope", &resp, &output, &exit_now);
+    CHECK(resp.status && strstr(resp.status, "unknown command") != NULL, "load unknown, got %s",
+          resp.status ? resp.status : "(null)");
+    task_cleanup(&resp, &output);
+}
+
+int main(int argc, char **argv) {
     agent_t a;
+    if (argc > 1 && strcmp(argv[1], "--hang") == 0) {
+        Sleep(30000);
+        return 0;
+    }
     memset(&a, 0, sizeof(a));
     test_command_in_list();
     test_xfer_chunk_size();
@@ -302,6 +441,8 @@ int main(void) {
     test_ls_json(&a);
     test_rm_mkdir(&a);
     test_transfer_errors(&a);
+    test_ps_kill(&a);
+    test_load_unload(&a);
     if (failures == 0)
         printf("tasks: all pass\n");
     return failures != 0;

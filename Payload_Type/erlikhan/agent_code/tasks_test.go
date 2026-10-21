@@ -2,7 +2,10 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -149,4 +152,73 @@ func TestDispatchRmMkdir(t *testing.T) {
 	if !strings.HasPrefix(resp.Status, "error:") {
 		t.Fatalf("rm missing should error, got %+v", resp)
 	}
+}
+
+func TestRuntimeLoadUnload(t *testing.T) {
+	old := includedCommands
+	includedCommands = "shell,load,unload"
+	defer func() { includedCommands = old }()
+	if resp, _ := dispatchAs(t, "sleep", `{"arguments":"1"}`); resp.Status != "error: command sleep not included in this build" {
+		t.Fatalf("sleep should start excluded: %+v", resp)
+	}
+	if resp, _ := dispatchAs(t, "load", `{"arguments":"sleep"}`); resp.Status != "success" {
+		t.Fatalf("load: %+v", resp)
+	}
+	if resp, _ := dispatchAs(t, "sleep", `{"arguments":"1"}`); resp.Status != "success" {
+		t.Fatalf("sleep after load: %+v", resp)
+	}
+	if resp, _ := dispatchAs(t, "unload", `{"arguments":"sleep"}`); resp.Status != "success" {
+		t.Fatalf("unload: %+v", resp)
+	}
+	if resp, _ := dispatchAs(t, "sleep", `{"arguments":"1"}`); resp.Status != "error: command sleep not included in this build" {
+		t.Fatalf("sleep after unload: %+v", resp)
+	}
+	if resp, _ := dispatchAs(t, "unload", `{"arguments":"exit"}`); !strings.Contains(resp.Status, "cannot unload") {
+		t.Fatalf("unload exit: %+v", resp)
+	}
+	if resp, _ := dispatchAs(t, "load", `{"arguments":"nope"}`); !strings.Contains(resp.Status, "unknown command") {
+		t.Fatalf("load unknown: %+v", resp)
+	}
+}
+
+func checkArtifact(t *testing.T, resp Response, base, want string) {
+	t.Helper()
+	if resp.Artifacts == nil || len(*resp.Artifacts) != 1 {
+		t.Fatalf("artifacts: %+v", resp.Artifacts)
+	}
+	got := (*resp.Artifacts)[0]
+	if got.BaseArtifact != base || !strings.Contains(got.Artifact, want) {
+		t.Fatalf("artifact: %+v", got)
+	}
+}
+
+func TestArtifacts(t *testing.T) {
+	resp, _ := dispatchAs(t, "shell", `{"arguments":"echo hi"}`)
+	if resp.Status != "success" {
+		t.Fatalf("shell: %+v", resp)
+	}
+	checkArtifact(t, resp, "Process Create", "cmd.exe /c echo hi")
+	path := filepath.Join(t.TempDir(), "gone.txt")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = dispatchAs(t, "rm", `{"arguments":`+quoteForTest(path)+`}`)
+	if resp.Status != "success" {
+		t.Fatalf("rm: %+v", resp)
+	}
+	checkArtifact(t, resp, "File Delete", "gone.txt")
+	if runtime.GOOS == "windows" {
+		t.Skip("child kill covered by windows CI")
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skip("sleep unavailable")
+	}
+	resp, _ = dispatchAs(t, "kill", `{"arguments":"`+strconv.Itoa(cmd.Process.Pid)+`"}`)
+	if resp.Status != "success" {
+		cmd.Process.Kill()
+		t.Fatalf("kill: %+v", resp)
+	}
+	checkArtifact(t, resp, "Process Kill", "pid ")
+	cmd.Wait()
 }

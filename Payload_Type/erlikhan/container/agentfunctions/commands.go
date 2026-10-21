@@ -3,10 +3,12 @@ package agentfunctions
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	agentstructs "github.com/MythicMeta/MythicContainer/agent_structs"
 	"github.com/MythicMeta/MythicContainer/logging"
+	"github.com/MythicMeta/MythicContainer/mythicrpc"
 	"github.com/mitchellh/mapstructure"
 )
 
@@ -95,6 +97,147 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// killLine validates a CLI pid argument.
+func killLine(args *agentstructs.PTTaskMessageArgsData, input string) error {
+	pid, err := parsePID(strings.TrimSpace(input))
+	if err != nil {
+		return err
+	}
+	args.AddArg(agentstructs.CommandParameter{
+		Name:          "arguments",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_STRING,
+		DefaultValue:  strconv.Itoa(pid),
+	})
+	return nil
+}
+
+// killDict reads the process-browser tasking {host, process_id,
+// architecture}; only the pid matters to this single-host agent.
+func killDict(args *agentstructs.PTTaskMessageArgsData, input map[string]any) error {
+	var decoded struct {
+		ProcessID any `mapstructure:"process_id"`
+	}
+	if err := mapstructure.Decode(input, &decoded); err != nil {
+		logging.LogError(err, "Failed to decode kill arguments")
+		return err
+	}
+	pid, err := parsePID(fmt.Sprint(decoded.ProcessID))
+	if err != nil {
+		return err
+	}
+	args.AddArg(agentstructs.CommandParameter{
+		Name:          "arguments",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_STRING,
+		DefaultValue:  strconv.Itoa(pid),
+	})
+	return nil
+}
+
+func parsePID(s string) (int, error) {
+	pid, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("usage: kill <pid>")
+	}
+	return pid, nil
+}
+
+// knownCommand reports whether name is a registered command.
+func knownCommand(name string) bool {
+	for _, s := range commandSpecs {
+		if s.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// protectedCommands cannot be unloaded at runtime: without them a
+// callback could neither exit nor load anything back.
+var protectedCommands = []string{"exit", "load", "unload"}
+
+func isProtected(name string) bool {
+	for _, p := range protectedCommands {
+		if p == name {
+			return true
+		}
+	}
+	return false
+}
+
+// loadTarget validates the load/unload argument.
+func loadTarget(taskData *agentstructs.PTTaskMessageAllData) (string, error) {
+	name, err := taskData.Args.GetStringArg("arguments")
+	if err != nil {
+		return "", err
+	}
+	name = strings.TrimSpace(name)
+	if !knownCommand(name) {
+		return "", fmt.Errorf("unknown command %q", name)
+	}
+	return name, nil
+}
+
+// loadTask marks a command loaded on the callback; the agent flips its
+// own runtime allowlist when the task runs. All handlers stay compiled
+// in, so any known command can be loaded back.
+func loadTask(taskData *agentstructs.PTTaskMessageAllData) agentstructs.PTTaskCreateTaskingMessageResponse {
+	response := agentstructs.PTTaskCreateTaskingMessageResponse{Success: true, TaskID: taskData.Task.ID}
+	name, err := loadTarget(taskData)
+	if err != nil {
+		response.Error, response.Success = err.Error(), false
+		return response
+	}
+	resp, err := mythicrpc.SendMythicRPCCallbackAddCommand(mythicrpc.MythicRPCCallbackAddCommandMessage{
+		TaskID: taskData.Task.ID, Commands: []string{name},
+	})
+	if err != nil {
+		logging.LogError(err, "Failed to add command to callback")
+		response.Error, response.Success = err.Error(), false
+		return response
+	}
+	if resp == nil || !resp.Success {
+		msg := "unknown error"
+		if resp != nil {
+			msg = resp.Error
+		}
+		response.Error, response.Success = msg, false
+		return response
+	}
+	response.DisplayParams = &name
+	return response
+}
+
+func unloadTask(taskData *agentstructs.PTTaskMessageAllData) agentstructs.PTTaskCreateTaskingMessageResponse {
+	response := agentstructs.PTTaskCreateTaskingMessageResponse{Success: true, TaskID: taskData.Task.ID}
+	name, err := loadTarget(taskData)
+	if err != nil {
+		response.Error, response.Success = err.Error(), false
+		return response
+	}
+	if isProtected(name) {
+		response.Error, response.Success = fmt.Sprintf("cannot unload %s", name), false
+		return response
+	}
+	resp, err := mythicrpc.SendMythicRPCCallbackRemoveCommand(mythicrpc.MythicRPCCallbackRemoveCommandMessage{
+		TaskID: taskData.Task.ID, Commands: []string{name},
+	})
+	if err != nil {
+		logging.LogError(err, "Failed to remove command from callback")
+		response.Error, response.Success = err.Error(), false
+		return response
+	}
+	if resp == nil || !resp.Success {
+		msg := "unknown error"
+		if resp != nil {
+			msg = resp.Error
+		}
+		response.Error, response.Success = msg, false
+		return response
+	}
+	response.DisplayParams = &name
+	return response
 }
 
 // uploadDict handles the task-modal form: {"file": <uuid>, "remote_path":
@@ -204,31 +347,50 @@ type commandSpec struct {
 	parseDict     agentstructs.PtTaskFunctionParseArgDictionary
 }
 
-var commandSpecs = []commandSpec{
-	{name: "shell", help: "shell <command>", description: "shell <command> (cmd.exe /c)",
-		mitre: []string{"T1059"}, builtin: true},
-	{name: "powershell", help: "powershell <command>", description: "powershell <command> (powershell.exe /c)",
-		mitre: []string{"T1059.001"}, builtin: true},
-	{name: "sleep", help: "sleep <interval> [jitter]",
-		description: "sleep <interval> [jitter] (seconds, jitter percent)", builtin: true},
-	{name: "ls", help: "ls [path]", description: "ls [path] (list directory, file browser)",
-		mitre: []string{"T1083"}, uiFeatures: []string{"file_browser:list"},
-		suggested: true, parseDict: fbPathDict},
-	{name: "download", help: "download <path>", description: "download <path> (agent -> Mythic)",
-		mitre: []string{"T1030"}, uiFeatures: []string{"file_browser:download"},
-		suggested: true, parseDict: fbPathDict},
-	{name: "upload", help: `upload {"remote_path": "...", "file": "<uuid>"} (or task modal)`,
-		description: "upload a Mythic file to the target (remote_path + file)",
-		mitre:       []string{"T1105"}, uiFeatures: []string{"file_browser:upload"},
-		suggested:     true,
-		createTasking: uploadTask, parseString: uploadLine, parseDict: uploadDict},
-	{name: "rm", help: "rm <path>", description: "rm <path> (recursive delete)",
-		mitre: []string{"T1070"}, uiFeatures: []string{"file_browser:remove"},
-		suggested: true, parseDict: fbPathDict},
-	{name: "mkdir", help: "mkdir <path>", description: "mkdir <path> (create directory)",
-		suggested: true, parseDict: fbPathDict},
-	{name: "exit", help: "exit", description: "exit the agent",
-		uiFeatures: []string{"callback_table:exit"}, builtin: true, noArgs: true},
+// Built in init: load/unload tasking references the specs, so a package
+// var initializer would be an initialization cycle.
+var commandSpecs []commandSpec
+
+func init() {
+	commandSpecs = []commandSpec{
+		{name: "shell", help: "shell <command>", description: "shell <command> (cmd.exe /c)",
+			mitre: []string{"T1059"}, builtin: true},
+		{name: "powershell", help: "powershell <command>", description: "powershell <command> (powershell.exe /c)",
+			mitre: []string{"T1059.001"}, builtin: true},
+		{name: "sleep", help: "sleep <interval> [jitter]",
+			description: "sleep <interval> [jitter] (seconds, jitter percent)", builtin: true},
+		{name: "ls", help: "ls [path]", description: "ls [path] (list directory, file browser)",
+			mitre: []string{"T1083"}, uiFeatures: []string{"file_browser:list"},
+			suggested: true, parseDict: fbPathDict},
+		{name: "download", help: "download <path>", description: "download <path> (agent -> Mythic)",
+			mitre: []string{"T1030"}, uiFeatures: []string{"file_browser:download"},
+			suggested: true, parseDict: fbPathDict},
+		{name: "upload", help: `upload {"remote_path": "...", "file": "<uuid>"} (or task modal)`,
+			description: "upload a Mythic file to the target (remote_path + file)",
+			mitre:       []string{"T1105"}, uiFeatures: []string{"file_browser:upload"},
+			suggested:     true,
+			createTasking: uploadTask, parseString: uploadLine, parseDict: uploadDict},
+		{name: "rm", help: "rm <path>", description: "rm <path> (recursive delete)",
+			mitre: []string{"T1070"}, uiFeatures: []string{"file_browser:remove"},
+			suggested: true, parseDict: fbPathDict},
+		{name: "mkdir", help: "mkdir <path>", description: "mkdir <path> (create directory)",
+			suggested: true, parseDict: fbPathDict},
+		{name: "ps", help: "ps", description: "ps (list processes, process browser)",
+			mitre: []string{"T1057"}, uiFeatures: []string{"process_browser:list"},
+			suggested: true, noArgs: true},
+		{name: "kill", help: "kill <pid>", description: "kill <pid> (terminate process)",
+			mitre: []string{"T1106"}, uiFeatures: []string{"kill", "process_browser:kill"},
+			suggested: true, parseString: killLine, parseDict: killDict},
+		{name: "load", help: "load <command>", description: "load <command> (enable at runtime)",
+			suggested: true, createTasking: loadTask},
+		{name: "unload", help: "unload <command>", description: "unload <command> (disable at runtime)",
+			suggested: true, createTasking: unloadTask},
+		{name: "exit", help: "exit", description: "exit the agent",
+			uiFeatures: []string{"callback_table:exit"}, builtin: true, noArgs: true},
+	}
+	for _, s := range commandSpecs {
+		s.register()
+	}
 }
 
 // AllCommandNames lists every command the agent implements, in spec order.
@@ -312,10 +474,4 @@ func (s commandSpec) register() {
 		}
 	}
 	agentstructs.AllPayloadData.Get("erlikhan").AddCommand(cmd)
-}
-
-func init() {
-	for _, s := range commandSpecs {
-		s.register()
-	}
 }

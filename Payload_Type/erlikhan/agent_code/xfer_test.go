@@ -273,6 +273,48 @@ func TestRemoveAndMakeDir(t *testing.T) {
 	}
 }
 
+func TestDispatchDownloadViaFake(t *testing.T) {
+	content := []byte(strings.Repeat("0123456789abcdef", 200))
+	path := filepath.Join(t.TempDir(), "f.bin")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeDownloadMythic{}
+	a := &Agent{post: fake.post}
+	resp, _ := a.dispatch(Task{Command: "download", Parameters: `{"arguments":` + quoteForTest(path) + `}`, ID: "t9"})
+	if resp.Status != "success" {
+		t.Fatalf("download: %+v", resp)
+	}
+	if string(fake.received) != string(content) {
+		t.Fatal("chunks do not reassemble")
+	}
+	if resp.Artifacts == nil || (*resp.Artifacts)[0].BaseArtifact != "File Download" {
+		t.Fatalf("artifacts: %+v", resp.Artifacts)
+	}
+}
+
+func TestDispatchUploadViaFake(t *testing.T) {
+	content := []byte(strings.Repeat("zyxwvuts", 200))
+	fake := &fakeUploadMythic{content: content, wantID: "uuid-7"}
+	dst := filepath.Join(t.TempDir(), "out.bin")
+	a := &Agent{post: fake.post}
+	resp, _ := a.dispatch(Task{
+		Command:    "upload",
+		Parameters: `{"file": "uuid-7", "remote_path": ` + quoteForTest(dst) + `}`,
+		ID:         "t10",
+	})
+	if resp.Status != "success" {
+		t.Fatalf("upload: %+v", resp)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil || string(got) != string(content) {
+		t.Fatal("written file differs")
+	}
+	if resp.Artifacts == nil || (*resp.Artifacts)[0].BaseArtifact != "File Upload" {
+		t.Fatalf("artifacts: %+v", resp.Artifacts)
+	}
+}
+
 func TestTaskParam(t *testing.T) {
 	if got := taskParam(`{"file": "u", "remote_path": "r"}`, "file"); got != "u" {
 		t.Fatalf("file = %q", got)

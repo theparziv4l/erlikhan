@@ -56,14 +56,18 @@ func TestCoreCommandsAreBuiltin(t *testing.T) {
 func TestOptionalCommandsAreSelectable(t *testing.T) {
 	cmds := registeredCommands(t)
 	for _, tc := range []struct {
-		name      string
-		uiFeature string
+		name       string
+		uiFeatures []string
 	}{
-		{"ls", "file_browser:list"},
-		{"download", "file_browser:download"},
-		{"upload", "file_browser:upload"},
-		{"rm", "file_browser:remove"},
-		{"mkdir", ""},
+		{"ls", []string{"file_browser:list"}},
+		{"download", []string{"file_browser:download"}},
+		{"upload", []string{"file_browser:upload"}},
+		{"rm", []string{"file_browser:remove"}},
+		{"mkdir", nil},
+		{"ps", []string{"process_browser:list"}},
+		{"kill", []string{"kill", "process_browser:kill"}},
+		{"load", nil},
+		{"unload", nil},
 	} {
 		c := findCommand(t, cmds, tc.name)
 		if c.CommandAttributes.CommandIsBuiltin {
@@ -72,18 +76,87 @@ func TestOptionalCommandsAreSelectable(t *testing.T) {
 		if !c.CommandAttributes.CommandIsSuggested {
 			t.Errorf("%s should be suggested (pre-selected) for new payloads", tc.name)
 		}
-		if tc.uiFeature == "" {
-			continue
-		}
-		found := false
-		for _, f := range c.SupportedUIFeatures {
-			if f == tc.uiFeature {
-				found = true
+		for _, want := range tc.uiFeatures {
+			found := false
+			for _, f := range c.SupportedUIFeatures {
+				if f == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("%s lacks UI feature %q (have %v)", tc.name, want, c.SupportedUIFeatures)
 			}
 		}
-		if !found {
-			t.Errorf("%s lacks UI feature %q (have %v)", tc.name, tc.uiFeature, c.SupportedUIFeatures)
+	}
+}
+
+func TestLoadTarget(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	args.AddArg(agentstructs.CommandParameter{Name: "arguments",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_STRING, DefaultValue: "ls"})
+	name, err := loadTarget(&agentstructs.PTTaskMessageAllData{
+		Task: agentstructs.PTTaskMessageTaskData{ID: 1}, Args: *args,
+	})
+	if err != nil || name != "ls" {
+		t.Fatalf("target: %q %v", name, err)
+	}
+	args = &agentstructs.PTTaskMessageArgsData{}
+	args.AddArg(agentstructs.CommandParameter{Name: "arguments",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_STRING, DefaultValue: "nope"})
+	if _, err := loadTarget(&agentstructs.PTTaskMessageAllData{Args: *args}); err == nil {
+		t.Fatal("unknown command should fail")
+	}
+	if _, err := loadTarget(&agentstructs.PTTaskMessageAllData{}); err == nil {
+		t.Fatal("missing arg should fail")
+	}
+}
+
+func TestUnloadProtection(t *testing.T) {
+	for _, p := range []string{"exit", "load", "unload"} {
+		if !isProtected(p) {
+			t.Errorf("%s should be protected", p)
 		}
+	}
+	for _, ok := range []string{"shell", "ls", "ps"} {
+		if isProtected(ok) {
+			t.Errorf("%s should not be protected", ok)
+		}
+	}
+	if !knownCommand("sleep") || knownCommand("nope") {
+		t.Fatal("knownCommand wrong")
+	}
+}
+
+func TestKillParse(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	if err := killLine(args, "1234"); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "arguments"); got != "1234" {
+		t.Fatalf("pid = %q", got)
+	}
+	for _, bad := range []string{"", "abc", "0", "-4", "12x"} {
+		if err := killLine(&agentstructs.PTTaskMessageArgsData{}, bad); err == nil {
+			t.Fatalf("input %q should fail", bad)
+		}
+	}
+	args = &agentstructs.PTTaskMessageArgsData{}
+	err := killDict(args, map[string]any{"host": "H", "process_id": float64(5678), "architecture": "x64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "arguments"); got != "5678" {
+		t.Fatalf("pid = %q", got)
+	}
+	args = &agentstructs.PTTaskMessageArgsData{}
+	if err := killDict(args, map[string]any{"host": "H", "process_id": "4321"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "arguments"); got != "4321" {
+		t.Fatalf("pid = %q", got)
+	}
+	if err := killDict(&agentstructs.PTTaskMessageArgsData{}, map[string]any{}); err == nil {
+		t.Fatal("missing pid should fail")
 	}
 }
 
