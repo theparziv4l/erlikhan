@@ -83,3 +83,70 @@ func TestDispatchLs(t *testing.T) {
 func quoteForTest(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
 }
+
+func TestDispatchLsShape(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ := dispatchAs(t, "ls", `{"arguments":`+quoteForTest(dir)+`}`)
+	if resp.Status != "success" || resp.FileBrowser == nil || resp.FileBrowser.Files == nil {
+		t.Fatalf("ls: %+v", resp)
+	}
+	if len(*resp.FileBrowser.Files) != 1 || resp.FileBrowser.Name == "" {
+		t.Fatalf("file_browser: %+v", resp.FileBrowser)
+	}
+	resp, _ = dispatchAs(t, "ls", `{"arguments":`+quoteForTest(filepath.Join(dir, "missing"))+`}`)
+	if !strings.HasPrefix(resp.Status, "error:") {
+		t.Fatalf("ls missing should error, got %+v", resp)
+	}
+}
+
+func TestDispatchDownloadErrors(t *testing.T) {
+	// Missing file fails before any network use.
+	resp, _ := dispatchAs(t, "download", `{"arguments":`+quoteForTest(filepath.Join(t.TempDir(), "missing"))+`}`)
+	if !strings.HasPrefix(resp.Status, "error:") {
+		t.Fatalf("download missing should error, got %+v", resp)
+	}
+	old := includedCommands
+	includedCommands = "shell"
+	defer func() { includedCommands = old }()
+	resp, _ = dispatchAs(t, "download", `{"arguments":"x"}`)
+	if resp.Status != "error: command download not included in this build" {
+		t.Fatalf("excluded download: %+v", resp)
+	}
+}
+
+func TestDispatchUploadErrors(t *testing.T) {
+	resp, _ := dispatchAs(t, "upload", `{"remote_path": "C:\\x"}`)
+	if !strings.HasPrefix(resp.Status, "error:") {
+		t.Fatalf("upload without file should error, got %+v", resp)
+	}
+	resp, _ = dispatchAs(t, "upload", `{"file": "u"}`)
+	if !strings.HasPrefix(resp.Status, "error:") {
+		t.Fatalf("upload without path should error, got %+v", resp)
+	}
+}
+
+func TestDispatchRmMkdir(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "newdir")
+	resp, _ := dispatchAs(t, "mkdir", `{"arguments":`+quoteForTest(sub)+`}`)
+	if resp.Status != "success" {
+		t.Fatalf("mkdir: %+v", resp)
+	}
+	if st, err := os.Stat(sub); err != nil || !st.IsDir() {
+		t.Fatal("dir not created")
+	}
+	resp, _ = dispatchAs(t, "rm", `{"arguments":`+quoteForTest(sub)+`}`)
+	if resp.Status != "success" || resp.RemovedFiles == nil || len(*resp.RemovedFiles) != 1 {
+		t.Fatalf("rm: %+v", resp)
+	}
+	if _, err := os.Stat(sub); !os.IsNotExist(err) {
+		t.Fatal("dir not removed")
+	}
+	resp, _ = dispatchAs(t, "rm", `{"arguments":`+quoteForTest(sub)+`}`)
+	if !strings.HasPrefix(resp.Status, "error:") {
+		t.Fatalf("rm missing should error, got %+v", resp)
+	}
+}

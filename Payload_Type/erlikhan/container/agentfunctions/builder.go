@@ -83,7 +83,7 @@ var payloadDefinition = agentstructs.PayloadType{
 	SupportedOS:            []string{agentstructs.SUPPORTED_OS_WINDOWS},
 	Wrapper:                false,
 	SupportsDynamicLoading: true,
-	Description:            "multi-profile agent (http, mqtt, dns, msteams; shell/powershell/sleep/ls/exit; go or native C)",
+	Description:            "multi-profile agent (http, mqtt, dns, msteams; shell/powershell/sleep/ls/download/upload/rm/mkdir/exit; go or native C)",
 	SupportedC2Profiles:    []string{"http", "mqtt", "dns", "msteams"},
 	MythicEncryptsData:     true,
 	MessageFormat:          agentstructs.MessageFormatJSON,

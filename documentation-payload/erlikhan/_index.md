@@ -5,7 +5,8 @@ title: Erlikhan
 Erlikhan is a Mythic payload type. The agent talks to the `http`,
 `mqtt`, `dns`, and `msteams` C2 profiles, encrypts with the profile PSK
 (`aes256_hmac`) or plaintext (`none`), and implements `shell`,
-`powershell`, `sleep`, `ls`, `exit`. The default build is a Go agent;
+`powershell`, `sleep`, `ls`, `download`, `upload`, `rm`, `mkdir`,
+`exit`. The default build is a Go agent;
 `compiler=native` builds the small native C agent instead (zig cc,
 no Go runtime).
 
@@ -105,8 +106,21 @@ signing, PE post-processing and packaging apply to both compilers.
 - `shell <command>` runs `cmd.exe /c`.
 - `powershell <command>` runs `powershell.exe /c`.
 - `sleep <interval> [jitter]` sets callback seconds and jitter percent.
-- `ls [path]` lists a directory (default `.`).
+- `ls [path]` lists a directory (default `.`) and populates the file
+  browser.
+- `download <path>` pulls a file from the target to Mythic (chunked).
+- `upload` pushes a Mythic file to `remote_path` on the target: pick
+  the file in the task modal, or from the CLI pass
+  `{"remote_path": "...", "file": "<mythic-file-uuid>"}`.
+- `rm <path>` recursively deletes a file or directory tree and prunes
+  it from the file browser.
+- `mkdir <path>` creates a directory with parents.
 - `exit` posts a final response and stops the agent.
+
+File transfers are chunked inside the task (512KB per chunk on `http`
+and `mqtt`, 8KB on `dns` and `msteams` where messages are small), so
+large files over `dns`/`msteams` are slow but work. The agent is
+single-host: file-browser `host` fields are ignored.
 
 ## Adding or removing commands
 

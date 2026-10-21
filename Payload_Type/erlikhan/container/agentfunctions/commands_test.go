@@ -55,12 +55,35 @@ func TestCoreCommandsAreBuiltin(t *testing.T) {
 
 func TestOptionalCommandsAreSelectable(t *testing.T) {
 	cmds := registeredCommands(t)
-	ls := findCommand(t, cmds, "ls")
-	if ls.CommandAttributes.CommandIsBuiltin {
-		t.Error("ls must not be builtin (operators should be able to remove it)")
-	}
-	if !ls.CommandAttributes.CommandIsSuggested {
-		t.Error("ls should be suggested (pre-selected) for new payloads")
+	for _, tc := range []struct {
+		name      string
+		uiFeature string
+	}{
+		{"ls", "file_browser:list"},
+		{"download", "file_browser:download"},
+		{"upload", "file_browser:upload"},
+		{"rm", "file_browser:remove"},
+		{"mkdir", ""},
+	} {
+		c := findCommand(t, cmds, tc.name)
+		if c.CommandAttributes.CommandIsBuiltin {
+			t.Errorf("%s must not be builtin (operators should be able to remove it)", tc.name)
+		}
+		if !c.CommandAttributes.CommandIsSuggested {
+			t.Errorf("%s should be suggested (pre-selected) for new payloads", tc.name)
+		}
+		if tc.uiFeature == "" {
+			continue
+		}
+		found := false
+		for _, f := range c.SupportedUIFeatures {
+			if f == tc.uiFeature {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s lacks UI feature %q (have %v)", tc.name, tc.uiFeature, c.SupportedUIFeatures)
+		}
 	}
 }
 
@@ -118,11 +141,12 @@ func TestResolveCommandList(t *testing.T) {
 		t.Errorf("expected 4 auto-added core commands, got %v", added)
 	}
 
-	final, added, err = resolveCommandList([]string{"ls", "ls", "shell", "powershell", "sleep", "exit"})
+	dupes := append([]string{"ls"}, all...)
+	final, added, err = resolveCommandList(dupes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(final) != 5 {
+	if len(final) != len(all) {
 		t.Errorf("duplicates should collapse, got %v", final)
 	}
 	if len(added) != 0 {
@@ -197,4 +221,107 @@ func sortedCopy(in []string) []string {
 	out := append([]string(nil), in...)
 	sort.Strings(out)
 	return out
+}
+
+func stringArg(t *testing.T, args *agentstructs.PTTaskMessageArgsData, name string) string {
+	t.Helper()
+	v, err := args.GetStringArg(name)
+	if err != nil {
+		t.Fatalf("arg %q: %v", name, err)
+	}
+	return v
+}
+
+func TestFbPathDict(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input map[string]any
+		want  string
+	}{
+		{"full path wins", map[string]any{"path": "C:\\a", "full_path": "C:\\a\\b", "file": "c"}, "C:\\a\\b"},
+		{"path fallback", map[string]any{"path": "C:\\a"}, "C:\\a"},
+		{"file fallback", map[string]any{"file": "c", "host": "H"}, "c"},
+		{"plain arguments", map[string]any{"arguments": "C:\\x"}, "C:\\x"},
+		{"plain path", map[string]any{"path": "C:\\x"}, "C:\\x"},
+		{"empty", map[string]any{}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := &agentstructs.PTTaskMessageArgsData{}
+			if err := fbPathDict(args, tc.input); err != nil {
+				t.Fatal(err)
+			}
+			if got := stringArg(t, args, "arguments"); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUploadDict(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	err := uploadDict(args, map[string]any{"file": "uuid-1", "remote_path": "C:\\x\\a.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "remote_path"); got != "C:\\x\\a.bin" {
+		t.Fatalf("remote_path = %q", got)
+	}
+	fileID, err := args.GetFileArg("file")
+	if err != nil || fileID != "uuid-1" {
+		t.Fatalf("file = %q, err %v", fileID, err)
+	}
+	// Browser context supplies the remote path.
+	args = &agentstructs.PTTaskMessageArgsData{}
+	if err := uploadDict(args, map[string]any{"file": "uuid-2", "full_path": "C:\\drop"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "remote_path"); got != "C:\\drop" {
+		t.Fatalf("remote_path = %q", got)
+	}
+	// No file chosen.
+	if err := uploadDict(&agentstructs.PTTaskMessageArgsData{}, map[string]any{"remote_path": "x"}); err == nil {
+		t.Fatal("missing file should fail")
+	}
+}
+
+func TestUploadLine(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	err := uploadLine(args, `{"remote_path": "C:\\x", "file": "uuid-3"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "remote_path"); got != "C:\\x" {
+		t.Fatalf("remote_path = %q", got)
+	}
+	if _, err := args.GetFileArg("file"); err != nil {
+		t.Fatalf("file: %v", err)
+	}
+	for _, bad := range []string{"", "C:\\x", `{"remote_path": "C:\\x"}`, "{nope"} {
+		if err := uploadLine(&agentstructs.PTTaskMessageArgsData{}, bad); err == nil {
+			t.Fatalf("input %q should fail", bad)
+		}
+	}
+}
+
+func TestUploadTask(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	args.AddArg(agentstructs.CommandParameter{Name: "remote_path",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_STRING, DefaultValue: "C:\\x"})
+	args.AddArg(agentstructs.CommandParameter{Name: "file",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_FILE, DefaultValue: "uuid-4"})
+	resp := uploadTask(&agentstructs.PTTaskMessageAllData{
+		Task: agentstructs.PTTaskMessageTaskData{ID: 7}, Args: *args,
+	})
+	if !resp.Success || resp.TaskID != 7 {
+		t.Fatalf("upload task: %+v", resp)
+	}
+	if resp.DisplayParams == nil || *resp.DisplayParams != "C:\\x" {
+		t.Fatalf("display params: %+v", resp.DisplayParams)
+	}
+	resp = uploadTask(&agentstructs.PTTaskMessageAllData{
+		Task: agentstructs.PTTaskMessageTaskData{ID: 8},
+	})
+	if resp.Success {
+		t.Fatal("missing args should fail")
+	}
 }

