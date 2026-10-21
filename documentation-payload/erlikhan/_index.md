@@ -5,7 +5,7 @@ title: Erlikhan
 Erlikhan is a Mythic payload type. The agent talks to the `http`,
 `mqtt`, `dns`, and `msteams` C2 profiles, encrypts with the profile PSK
 (`aes256_hmac`) or plaintext (`none`), and implements `shell`,
-`powershell`, `sleep`, `exit`. The default build is a Go agent;
+`powershell`, `sleep`, `ls`, `exit`. The default build is a Go agent;
 `compiler=native` builds the small native C agent instead (zig cc,
 no Go runtime).
 
@@ -105,7 +105,27 @@ signing, PE post-processing and packaging apply to both compilers.
 - `shell <command>` runs `cmd.exe /c`.
 - `powershell <command>` runs `powershell.exe /c`.
 - `sleep <interval> [jitter]` sets callback seconds and jitter percent.
+- `ls [path]` lists a directory (default `.`).
 - `exit` posts a final response and stops the agent.
+
+## Adding or removing commands
+
+`shell`, `powershell`, `sleep` and `exit` are builtin: every payload
+includes them and they cannot be unselected. Any other command can be
+added to or removed from a payload on the command-selection step of the
+build; the selected set is baked into the binary and anything outside
+it is refused with a "not included in this build" error.
+
+To add a new command, touch one place per layer:
+
+1. `container/agentfunctions/commands.go`: append a row to `commandSpecs`
+   (`builtin: true` only for commands every payload must have).
+2. `agent_code/tasks.go`: add a row to `commandTable` plus a handler.
+3. `agent_code_c/tasks.c`: add a row to `task_table` plus a `task_*`
+   handler (both agents implement the same set).
+4. Run `go test ./...` in `container/` (`TestCommandLayersAgree` fails
+   if the three layers disagree), `GO111MODULE=off go test` in
+   `agent_code/`, and the `tasks_test.c` builds under wine.
 
 ## Offline route
 

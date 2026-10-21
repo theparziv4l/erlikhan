@@ -13,6 +13,10 @@
 #ifndef CFG_NONCE
 #define CFG_NONCE ""
 #endif
+/* Comma-separated command set selected for this payload. Empty allows all. */
+#ifndef CFG_COMMANDS
+#define CFG_COMMANDS ""
+#endif
 
 int config_load(agent_config_t *out);
 

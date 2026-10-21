@@ -77,16 +77,17 @@ type agentConfig struct {
 }
 
 var payloadDefinition = agentstructs.PayloadType{
-	Name:                "erlikhan",
-	FileExtension:       "exe",
-	Author:              "erlikhan",
-	SupportedOS:         []string{agentstructs.SUPPORTED_OS_WINDOWS},
-	Wrapper:             false,
-	Description:         "multi-profile agent (http, mqtt, dns, msteams; shell/powershell/sleep/exit; go or native C)",
-	SupportedC2Profiles: []string{"http", "mqtt", "dns", "msteams"},
-	MythicEncryptsData:  true,
-	MessageFormat:       agentstructs.MessageFormatJSON,
-	BuildParameters:     buildParameters(),
+	Name:                   "erlikhan",
+	FileExtension:          "exe",
+	Author:                 "erlikhan",
+	SupportedOS:            []string{agentstructs.SUPPORTED_OS_WINDOWS},
+	Wrapper:                false,
+	SupportsDynamicLoading: true,
+	Description:            "multi-profile agent (http, mqtt, dns, msteams; shell/powershell/sleep/ls/exit; go or native C)",
+	SupportedC2Profiles:    []string{"http", "mqtt", "dns", "msteams"},
+	MythicEncryptsData:     true,
+	MessageFormat:          agentstructs.MessageFormatJSON,
+	BuildParameters:        buildParameters(),
 	BuildSteps: []agentstructs.BuildStep{
 		{Name: "Configuring", Description: "Reading C2 profile and build parameters"},
 		{Name: "Staging", Description: "Staging agent sources and assets"},
@@ -463,6 +464,11 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 	if err := checkProfileSupport(opts.compiler, msg.C2Profiles[0].Name, msg.C2Profiles[0].Parameters); err != nil {
 		return fail("Configuring", "unsupported profile", err)
 	}
+	commands, addedCore, err := resolveCommandList(msg.CommandList)
+	if err != nil {
+		return fail("Configuring", "bad command list", err)
+	}
+	resp.UpdatedCommandList = &commands
 	blob, key, nonce, err := assembleConfig(msg, opts.retries, opts.taskingSize)
 	if err != nil {
 		return fail("Configuring", "bad C2 parameters", err)
@@ -628,6 +634,9 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 	// Versioninfo .syso must exist before compile: go build picks it up from
 	// the package dir, zig cc links it once renamed. Order below mirrors
 	// the CLI pipeline exactly.
+	// The selected command set is baked into the binary; the agent
+	// refuses anything outside it with a "not included" error.
+	commandCSV := strings.Join(commands, ",")
 	exe := "agent.exe"
 	switch opts.versioninfo {
 	case "spoof":
@@ -644,7 +653,8 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 		args := []string{"cc", "-target", "x86_64-windows-gnu", "-O2", "-s",
 			`-DCFG_BLOB="` + blob + `"`,
 			`-DCFG_KEY="` + key + `"`,
-			`-DCFG_NONCE="` + nonce + `"`}
+			`-DCFG_NONCE="` + nonce + `"`,
+			`-DCFG_COMMANDS="` + commandCSV + `"`}
 		if !opts.console {
 			args = append(args, "-Wl,--subsystem,windows")
 		}
@@ -671,7 +681,8 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 		if !opts.console {
 			ldflags = "-s -w -H=windowsgui -buildid="
 		}
-		ldflags += fmt.Sprintf(" -X main.cfgBlob=%s -X main.cfgKey=%s -X main.cfgNonce=%s", blob, key, nonce)
+		ldflags += fmt.Sprintf(" -X main.cfgBlob=%s -X main.cfgKey=%s -X main.cfgNonce=%s -X main.includedCommands=%s",
+			blob, key, nonce, commandCSV)
 		args := []string{"build", "-trimpath", "-ldflags", ldflags, "-o", exe}
 		bin := "go"
 		if opts.garble {
@@ -763,6 +774,9 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 	resp.Payload = &payloadBytes
 	resp.UpdatedFilename = &filename
 	resp.BuildMessage = "Successfully built payload!"
+	if len(addedCore) > 0 {
+		resp.BuildMessage += fmt.Sprintf(" (builtin commands added: %s)", strings.Join(addedCore, ", "))
+	}
 	buildStep(msg.PayloadUUID, "Reporting back", true, "")
 	return resp
 }

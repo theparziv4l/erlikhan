@@ -560,3 +560,36 @@ func TestBuildDNSNative(t *testing.T) {
 		t.Fatalf("native agent suspiciously large: %d bytes", len(*resp.Payload))
 	}
 }
+
+func TestBuildCommandList(t *testing.T) {
+	t.Setenv("ERLIKHAN_OFFLINE", "1")
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain needed")
+	}
+	testServiceRoot(t)
+	msg := testBuildMessage("none", "")
+	msg.BuildParameters = *testBuildParams()
+	msg.CommandList = []string{"ls"}
+	resp := build(msg)
+	assertPE(t, resp, ".exe")
+	if resp.UpdatedCommandList == nil || len(*resp.UpdatedCommandList) != 5 {
+		t.Fatalf("updated commands = %v", resp.UpdatedCommandList)
+	}
+	if !strings.Contains(resp.BuildMessage, "builtin commands added") {
+		t.Fatalf("build should note added core commands: %q", resp.BuildMessage)
+	}
+}
+
+func TestBuildRejectsUnknownCommand(t *testing.T) {
+	t.Setenv("ERLIKHAN_OFFLINE", "1")
+	msg := testBuildMessage("none", "")
+	msg.BuildParameters = *testBuildParams()
+	msg.CommandList = []string{"shell", "rm-rf"}
+	resp := build(msg)
+	if resp.Success {
+		t.Fatal("build with unknown command succeeded")
+	}
+	if !strings.Contains(resp.BuildStdErr, "rm-rf") {
+		t.Fatalf("wrong error: %s", resp.BuildStdErr)
+	}
+}

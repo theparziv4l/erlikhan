@@ -14,6 +14,10 @@ var (
 	cfgBlob  string
 	cfgKey   string
 	cfgNonce string
+	// includedCommands is the comma-separated command set the operator
+	// selected for this payload. Empty means all commands (offline
+	// builds that do not pass -X keep working).
+	includedCommands string
 )
 
 // Config mirrors the Mythic http C2 profile parameters. Field names match

