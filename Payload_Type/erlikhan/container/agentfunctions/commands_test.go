@@ -66,6 +66,16 @@ func TestOptionalCommandsAreSelectable(t *testing.T) {
 		{"mkdir", nil},
 		{"ps", []string{"process_browser:list"}},
 		{"kill", []string{"kill", "process_browser:kill"}},
+		{"execute_assembly", nil},
+		{"execute_coff", nil},
+		{"whoami", nil},
+		{"env", nil},
+		{"pwd", nil},
+		{"cd", nil},
+		{"cp", nil},
+		{"mv", nil},
+		{"ipconfig", nil},
+		{"uptime", nil},
 		{"load", nil},
 		{"unload", nil},
 	} {
@@ -373,6 +383,317 @@ func TestUploadLine(t *testing.T) {
 		if err := uploadLine(&agentstructs.PTTaskMessageArgsData{}, bad); err == nil {
 			t.Fatalf("input %q should fail", bad)
 		}
+	}
+}
+
+func TestExecAsmDict(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	if err := execAsmDict(args, map[string]any{"assembly_file": "uuid-1", "assembly_arguments": "a b"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "assembly_arguments"); got != "a b" {
+		t.Fatalf("assembly_arguments = %q", got)
+	}
+	fileID, err := args.GetFileArg("assembly_file")
+	if err != nil || fileID != "uuid-1" {
+		t.Fatalf("assembly_file = %q, err %v", fileID, err)
+	}
+	if err := execAsmDict(&agentstructs.PTTaskMessageArgsData{}, map[string]any{}); err == nil {
+		t.Fatal("missing file should fail")
+	}
+}
+
+func TestExecAsmLine(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	if err := execAsmLine(args, `{"assembly_file": "uuid-2", "assembly_arguments": "--x"}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "assembly_arguments"); got != "--x" {
+		t.Fatalf("assembly_arguments = %q", got)
+	}
+	for _, bad := range []string{"", "uuid-2", `{"assembly_arguments": "x"}`, "{nope"} {
+		if err := execAsmLine(&agentstructs.PTTaskMessageArgsData{}, bad); err == nil {
+			t.Fatalf("input %q should fail", bad)
+		}
+	}
+}
+
+func TestExecAsmTask(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	args.AddArg(agentstructs.CommandParameter{Name: "assembly_file",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_FILE, DefaultValue: "uuid-3"})
+	args.AddArg(agentstructs.CommandParameter{Name: "assembly_arguments",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_STRING, DefaultValue: "a"})
+	resp := execAsmTask(&agentstructs.PTTaskMessageAllData{
+		Task: agentstructs.PTTaskMessageTaskData{ID: 11}, Args: *args,
+	})
+	if !resp.Success || resp.TaskID != 11 {
+		t.Fatalf("execute_assembly task: %+v", resp)
+	}
+	if resp.DisplayParams == nil || *resp.DisplayParams != "-Assembly uuid-3 -Arguments a" {
+		t.Fatalf("display params: %+v", resp.DisplayParams)
+	}
+	resp = execAsmTask(&agentstructs.PTTaskMessageAllData{
+		Task: agentstructs.PTTaskMessageTaskData{ID: 12},
+	})
+	if resp.Success {
+		t.Fatal("missing args should fail")
+	}
+}
+
+func TestCanonicalCoffType(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"s", "s"}, {"int16", "s"}, {"short", "s"}, {"-s", "s"},
+		{"i", "i"}, {"int32", "i"}, {"int", "i"}, {"integer", "i"}, {"-i", "i"},
+		{"z", "z"}, {"string", "z"}, {"-z", "z"},
+		{"Z", "Z"}, {"-Z", "Z"}, {"wchar", "Z"}, {"wstring", "Z"}, {"WCHAR", "Z"},
+		{"b", "b"}, {"base64", "b"}, {"file", "b"}, {"-b", "b"},
+	} {
+		got, ok := canonicalCoffType(tc.in)
+		if !ok || got != tc.want {
+			t.Errorf("type %q -> %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	for _, bad := range []string{"", "x", "bool", "float"} {
+		if _, ok := canonicalCoffType(bad); ok {
+			t.Errorf("type %q should fail", bad)
+		}
+	}
+}
+
+func TestNormalizeCoffArgs(t *testing.T) {
+	// Forge-shaped input: short codes, JSON numbers (float64).
+	got, err := normalizeCoffArgs([]any{
+		[]any{"i", float64(42)},
+		[]any{"Z", "hi"},
+		[]any{"b", "aGk="},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []coffArg{{"i", "42"}, {"Z", "hi"}, {"b", "aGk="}}
+	if len(got) != len(want) {
+		t.Fatalf("args = %+v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("args = %+v, want %+v", got, want)
+		}
+	}
+	// Long modal spellings normalize to short codes.
+	got, err = normalizeCoffArgs([]any{[]any{"string", "x"}, []any{"int16", "7"}})
+	if err != nil || len(got) != 2 || got[0].typ != "z" || got[1].typ != "s" {
+		t.Fatalf("long forms: %+v %v", got, err)
+	}
+	// Nil and empty mean no arguments.
+	if got, err := normalizeCoffArgs(nil); err != nil || got != nil {
+		t.Fatalf("nil: %+v %v", got, err)
+	}
+	if got, err := normalizeCoffArgs([]any{}); err != nil || len(got) != 0 {
+		t.Fatalf("empty: %+v %v", got, err)
+	}
+	for _, bad := range []any{
+		"nope",
+		[]any{[]any{"z"}},
+		[]any{[]any{"z", "a", "b"}},
+		[]any{[]any{"wobble", "a"}},
+		[]any{[]any{42, "a"}},
+		[]any{[]any{"i", 1.5}},
+		[]any{[]any{"i", true}},
+	} {
+		if _, err := normalizeCoffArgs(bad); err == nil {
+			t.Fatalf("input %+v should fail", bad)
+		}
+	}
+}
+
+func TestPackCoffArgs(t *testing.T) {
+	// Apollo-identical golden vectors: u32LE total, raw LE ints,
+	// LE-length-prefixed NUL-terminated strings, hexlified.
+	for _, tc := range []struct {
+		name string
+		args []coffArg
+		want string
+	}{
+		{"empty", nil, "00000000"},
+		{"int and string", []coffArg{{"i", "42"}, {"z", "hi"}},
+			"0b0000002a00000003000000686900"},
+		{"short", []coffArg{{"s", "-1"}}, "02000000ffff"},
+		{"wchar", []coffArg{{"Z", "A"}}, "080000000400000041000000"},
+		{"base64", []coffArg{{"b", "aGk="}}, "06000000020000006869"},
+	} {
+		got, err := packCoffArgs(tc.args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: got %s, want %s", tc.name, got, tc.want)
+		}
+	}
+	for _, bad := range [][]coffArg{
+		{{"s", "99999"}},
+		{{"s", "x"}},
+		{{"i", "99999999999"}},
+		{{"i", "x"}},
+		{{"b", "!!!"}},
+	} {
+		if _, err := packCoffArgs(bad); err == nil {
+			t.Fatalf("args %+v should fail", bad)
+		}
+	}
+}
+
+func TestCoffTimeout(t *testing.T) {
+	if coffTimeout(nil) != 30 || coffTimeout(float64(45)) != 45 {
+		t.Fatal("defaults")
+	}
+	if coffTimeout("60") != 60 || coffTimeout(7) != 7 || coffTimeout(int64(8)) != 8 {
+		t.Fatal("shapes")
+	}
+	if coffTimeout(0) != 1 || coffTimeout(-5) != 1 || coffTimeout(999999) != 86400 {
+		t.Fatal("clamp")
+	}
+	if coffTimeout("bogus") != 30 || coffTimeout(true) != 30 {
+		t.Fatal("fallback")
+	}
+}
+
+func TestCoffDict(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	err := coffDict(args, map[string]any{
+		"bof_file": "uuid-1", "function_name": "run", "timeout": float64(10),
+		"coff_arguments": []any{[]any{"string", "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "function_name"); got != "run" {
+		t.Fatalf("function_name = %q", got)
+	}
+	if n, err := args.GetNumberArg("timeout"); err != nil || n != 10 {
+		t.Fatalf("timeout = %v, err %v", n, err)
+	}
+	typed, err := args.GetTypedArrayArg("coff_arguments")
+	if err != nil || len(typed) != 1 || typed[0][0] != "z" || typed[0][1] != "hi" {
+		t.Fatalf("typed args = %+v, err %v", typed, err)
+	}
+	// Defaults: entrypoint go, timeout 30, no args.
+	args = &agentstructs.PTTaskMessageArgsData{}
+	if err := coffDict(args, map[string]any{"bof_file": "uuid-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringArg(t, args, "function_name"); got != "go" {
+		t.Fatalf("default function = %q", got)
+	}
+	if err := coffDict(&agentstructs.PTTaskMessageArgsData{}, map[string]any{}); err == nil {
+		t.Fatal("missing file should fail")
+	}
+	if err := coffDict(&agentstructs.PTTaskMessageArgsData{},
+		map[string]any{"bof_file": "uuid-2", "coff_arguments": "nope"}); err == nil {
+		t.Fatal("bad args should fail")
+	}
+}
+
+func TestCoffLine(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	err := coffLine(args, `{"bof_file": "uuid-3", "function_name": "go", "timeout": 5, "coff_arguments": [["i", 42]]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	typed, err := args.GetTypedArrayArg("coff_arguments")
+	if err != nil || len(typed) != 1 || typed[0][0] != "i" || typed[0][1] != "42" {
+		t.Fatalf("typed args = %+v, err %v", typed, err)
+	}
+	for _, bad := range []string{"", "uuid-3", `{"function_name": "go"}`, "{nope"} {
+		if err := coffLine(&agentstructs.PTTaskMessageArgsData{}, bad); err == nil {
+			t.Fatalf("input %q should fail", bad)
+		}
+	}
+}
+
+// TestCoffTaskForgeShape is the Forge-compat contract: short type codes
+// with JSON numbers, as Forge's forge_bof_* aliases forward them, must
+// pack to the Apollo-identical hex buffer.
+func TestCoffTaskForgeShape(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	args.AddArg(agentstructs.CommandParameter{Name: "bof_file",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_FILE, DefaultValue: "uuid-4"})
+	args.AddArg(agentstructs.CommandParameter{Name: "function_name",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_STRING, DefaultValue: "go"})
+	args.AddArg(agentstructs.CommandParameter{Name: "coff_arguments",
+		ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_TYPED_ARRAY,
+		DefaultValue:  []any{[]any{"i", float64(42)}, []any{"z", "hi"}}})
+	// Pass Args by struct copy like the framework does, then re-read
+	// through the same task handle: AddArg appends are only visible on
+	// the struct that create_tasking mutated.
+	td := &agentstructs.PTTaskMessageAllData{
+		Task: agentstructs.PTTaskMessageTaskData{ID: 13}, Args: *args,
+	}
+	resp := coffTask(td)
+	if !resp.Success || resp.TaskID != 13 {
+		t.Fatalf("coff task: %+v", resp)
+	}
+	if got := stringArg(t, &td.Args, "coff_arguments"); got != "0b0000002a00000003000000686900" {
+		t.Fatalf("packed args = %q", got)
+	}
+	if n, err := td.Args.GetNumberArg("timeout"); err != nil || n != 30 {
+		t.Fatalf("default timeout = %v, err %v", n, err)
+	}
+	if resp.DisplayParams == nil || *resp.DisplayParams != "-Coff uuid-4 -Function go -Timeout 30" {
+		t.Fatalf("display params: %+v", resp.DisplayParams)
+	}
+	resp = coffTask(&agentstructs.PTTaskMessageAllData{
+		Task: agentstructs.PTTaskMessageTaskData{ID: 14},
+	})
+	if resp.Success {
+		t.Fatal("missing args should fail")
+	}
+}
+
+func TestTwinPathLine(t *testing.T) {
+	for _, cmd := range []string{"cp", "mv"} {
+		parse := twinPathLine(cmd)
+		args := &agentstructs.PTTaskMessageArgsData{}
+		if err := parse(args, `C:\a C:\b`); err != nil {
+			t.Fatal(err)
+		}
+		if got := stringArg(t, args, "source"); got != `C:\a` {
+			t.Fatalf("source = %q", got)
+		}
+		if got := stringArg(t, args, "destination"); got != `C:\b` {
+			t.Fatalf("destination = %q", got)
+		}
+		args = &agentstructs.PTTaskMessageArgsData{}
+		if err := parse(args, `{"source": "a", "destination": "b"}`); err != nil {
+			t.Fatal(err)
+		}
+		for _, bad := range []string{"", "only", "a b c", `{"source": "a"}`} {
+			if err := parse(&agentstructs.PTTaskMessageArgsData{}, bad); err == nil {
+				t.Fatalf("%s input %q should fail", cmd, bad)
+			}
+		}
+	}
+}
+
+func TestTwinPathDictAndTask(t *testing.T) {
+	args := &agentstructs.PTTaskMessageArgsData{}
+	if err := twinPathDict(args, map[string]any{"source": "a", "destination": "b"}); err != nil {
+		t.Fatal(err)
+	}
+	resp := twinPathTask(&agentstructs.PTTaskMessageAllData{
+		Task: agentstructs.PTTaskMessageTaskData{ID: 15}, Args: *args,
+	})
+	if !resp.Success || resp.DisplayParams == nil || *resp.DisplayParams != "a -> b" {
+		t.Fatalf("twin task: %+v", resp)
+	}
+	if err := twinPathDict(&agentstructs.PTTaskMessageArgsData{}, map[string]any{"source": "a"}); err == nil {
+		t.Fatal("missing destination should fail")
+	}
+	resp = twinPathTask(&agentstructs.PTTaskMessageAllData{
+		Task: agentstructs.PTTaskMessageTaskData{ID: 16},
+	})
+	if resp.Success {
+		t.Fatal("missing args should fail")
 	}
 }
 

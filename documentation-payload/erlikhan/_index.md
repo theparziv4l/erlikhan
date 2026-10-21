@@ -6,7 +6,9 @@ Erlikhan is a Mythic payload type. The agent talks to the `http`,
 `mqtt`, `dns`, and `msteams` C2 profiles, encrypts with the profile PSK
 (`aes256_hmac`) or plaintext (`none`), and implements `shell`,
 `powershell`, `sleep`, `ls`, `download`, `upload`, `rm`, `mkdir`,
-`ps`, `kill`, `load`, `unload`, `exit`. The default build is a Go agent;
+`ps`, `kill`, `execute_assembly`, `execute_coff`, `whoami`, `env`,
+`pwd`, `cd`, `cp`, `mv`, `ipconfig`, `uptime`, `load`, `unload`,
+`exit`. The default build is a Go agent;
 `compiler=native` builds the small native C agent instead (zig cc,
 no Go runtime).
 
@@ -120,6 +122,27 @@ signing, PE post-processing and packaging apply to both compilers.
   agent reports pid/ppid/name; the native C agent adds image path,
   owner, integrity level and start time.
 - `kill <pid>` terminates a process.
+- `execute_assembly` runs a .NET assembly in-process via CLR hosting:
+  pick the assembly in the task modal (or pass
+  `{"assembly_file": "<mythic-file-uuid>", "assembly_arguments": "..."}`),
+  and the agent fetches it, stages it to a temp path, executes the
+  entry point with the argument string, captures stdout, and deletes
+  the stage. Needs .NET Framework on the target.
+- `execute_coff` runs a BOF object file (`.o`) in-process with the
+  Beacon API: `{"bof_file": "<mythic-file-uuid>",
+  "function_name": "go", "timeout": 30, "coff_arguments":
+  [["z", "hi"], ["i", 42]]}` (or the modal). The container packs the
+  typed arguments exactly like Apollo, so Armory BOFs behave the
+  same. x64 agents only; process-spawning Beacon APIs
+  (inject/spawn) are stubs that report failure.
+- `whoami` prints the current user and domain.
+- `env` dumps the process environment.
+- `pwd` / `cd <path>` print and change the working directory (per
+  process, so it persists across tasks on the callback).
+- `cp <source> <destination>` copies a file; `mv` moves/renames
+  (copy+delete across volumes).
+- `ipconfig` prints the host name and IPv4 addresses.
+- `uptime` prints system uptime.
 - `load <command>` / `unload <command>` enable or disable a command
   on a live callback without rebuilding. All handlers stay compiled
   in, so anything can be loaded back; `exit`, `load` and `unload`
@@ -135,6 +158,45 @@ File transfers are chunked inside the task (512KB per chunk on `http`
 and `mqtt`, 8KB on `dns` and `msteams` where messages are small), so
 large files over `dns`/`msteams` are slow but work. The agent is
 single-host: file-browser `host` fields are ignored.
+
+## Forge augmentations
+
+[Forge](https://github.com/MythicAgents/forge) is a command-augmentation
+payload: it contributes `forge_net_*` (.NET) and `forge_bof_*` (BOF)
+alias commands to other agents' callbacks. Erlikhan implements the two
+execution commands Forge targets, so after a one-time registration its
+callbacks can run SharpCollection and Armory tools directly:
+
+```bash
+sudo ./mythic-cli install github https://github.com/MythicAgents/forge
+```
+
+Then register erlikhan with Forge's `forge_support` command (or the
+equivalent row in Forge's `payload_type_support.json`, followed by a
+container restart):
+
+- payload type: `erlikhan`
+- BOF command: `execute_coff`, file param `bof_file`, args param
+  `coff_arguments`, entrypoint param `function_name`
+- assembly command: `execute_assembly`, file param `assembly_file`,
+  args param `assembly_arguments`
+- default assembly method: `execute_assembly`
+
+Tasking a `forge_net_Rubeus`-style alias then reprocesses into
+erlikhan's `execute_assembly` (and likewise BOF aliases into
+`execute_coff`), with Forge supplying the tool file and arguments.
+Notes:
+
+- Erlikhan maps only the `execute_assembly` method (Fork-and-Run in
+  Forge's UI wording, though execution stays in-process via CLR
+  hosting); there is no separate `inline_assembly` command, so picking
+  that method errors.
+- `execute_coff` needs an x64 agent build; x86 callbacks should task
+  .NET tools instead.
+- .NET output capture is reliable for the first `execute_assembly`
+  in a callback; the runtime caches the Console writer, so later runs
+  in the same process may lose Console output. Re-tasking after a
+  fresh callback, or `shell`, covers repeat-sensitive cases.
 
 ## Shellcode output and wrappers
 

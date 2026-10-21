@@ -8,6 +8,7 @@ sudo ./mythic-cli install github https://github.com/saidtunc/erlikhan
 sudo ./mythic-cli install github https://github.com/MythicC2Profiles/mqtt
 sudo ./mythic-cli install github https://github.com/MythicC2Profiles/dns
 sudo ./mythic-cli install github https://github.com/Whispergate/msteams
+sudo ./mythic-cli install github https://github.com/MythicAgents/forge
 ```
 
 Build a payload in the Mythic UI: type `erlikhan`, OS Windows, one C2

