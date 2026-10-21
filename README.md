@@ -10,5 +10,5 @@ sudo ./mythic-cli install github https://github.com/MythicC2Profiles/dns
 sudo ./mythic-cli install github https://github.com/Whispergate/msteams
 ```
 
-Build a payload in the Mythic UI: type `erlik`, OS Windows, one C2
-profile. Details in `documentation-payload/erlik/`.
+Build a payload in the Mythic UI: type `erlikhan`, OS Windows, one C2
+profile. Details in `documentation-payload/erlikhan/`.
