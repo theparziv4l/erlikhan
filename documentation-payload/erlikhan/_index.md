@@ -101,6 +101,7 @@ Every option that applies to an agent build is a build parameter:
 | palace_inject | ChooseOne | self | Palace: run in self / inject sacrificial host |
 | palace_hosts | String | — | Palace: host fallback order (default RuntimeBroker,SgrmBroker,WerFault,dllhost,notepad) |
 | palace_spec | File | — | Palace: custom spec file override |
+| palace_stager | Boolean | false | Palace: stager EXE wrapping the blob (needs shellcode=false) |
 | package | ChooseOne | none | none / zip / iso / img / vhd / 7z / msi |
 | package_password | String | — | 7z password |
 | msi_app_name | String | — | MSI product name |
@@ -248,8 +249,13 @@ a separate `palace_*` option:
   scheduler breaks all three, so they are rejected with
   `compiler=go` (same reason the Sliver port stubs them).
 - `palace_spec`: uploaded spec file replacing the default DSL.
+- `palace_stager`: wraps the blob in a runnable stager EXE instead of
+  emitting raw `.bin`. Needs `shellcode=false` (the outputs are
+  exclusive), `package=none` and `sign=none`; honors `console` for
+  the window. The stager maps the blob RWX — required, since the
+  blob mixes code with writable globals — and calls its entry.
 
-Notes: the blob mixes code with writable globals, so deliver it in an
+Notes: the raw blob mixes code with writable globals, so deliver it in an
 RWX mapping like any injector; the no-RWX guarantee covers the
 loader's own payload/PICO allocations. Sleep masking suspends every
 other thread in the process while masked and fails safe to a plain

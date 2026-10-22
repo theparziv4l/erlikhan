@@ -15,7 +15,7 @@ import (
 
 func testBuildParams() *agentstructs.BuildParameters {
 	p := map[string]any{}
-	for _, b := range []string{"garble", "console", "obfu_strings", "obfu_deadcode", "obfu_opaque", "obfu_mba", "obfu_controlflow", "obfu_winapi", "strip", "rename_sections", "pe_stomp", "sanitize", "iso_autorun", "shellcode", "palace_cfg", "palace_hooks", "palace_sleepmask", "palace_spoof"} {
+	for _, b := range []string{"garble", "console", "obfu_strings", "obfu_deadcode", "obfu_opaque", "obfu_mba", "obfu_controlflow", "obfu_winapi", "strip", "rename_sections", "pe_stomp", "sanitize", "iso_autorun", "shellcode", "palace_cfg", "palace_hooks", "palace_sleepmask", "palace_spoof", "palace_stager"} {
 		p[b] = false
 	}
 	for _, b := range []string{"palace_ror13", "palace_no_rwx", "palace_cleanup", "palace_xor"} {
@@ -203,6 +203,17 @@ func TestParseBuildParamsPalace(t *testing.T) {
 	if _, err := parseBuildParams(bp); err != nil {
 		t.Fatalf("native trio: %v", err)
 	}
+	// Stager parses with shellcode off.
+	bp = testBuildParams()
+	bp.Parameters["loader"] = "palace"
+	bp.Parameters["palace_stager"] = true
+	opts, err = parseBuildParams(bp)
+	if err != nil {
+		t.Fatalf("stager: %v", err)
+	}
+	if !opts.palaceStager || opts.shellcode {
+		t.Fatalf("stager flags: %+v", opts)
+	}
 }
 
 func TestDonutArch(t *testing.T) {
@@ -244,7 +255,11 @@ func TestParseBuildParamsRejects(t *testing.T) {
 		{"shellcode needs package none", map[string]any{"shellcode": true, "package": "zip"}, nil, "package=none"},
 		{"shellcode needs sign none", map[string]any{"shellcode": true, "sign": "self", "sign_domain": "x.example"}, nil, "sign=none"},
 		{"bad loader", map[string]any{"loader": "scarecrow"}, nil, "loader"},
-		{"palace needs shellcode", map[string]any{"loader": "palace"}, nil, "shellcode=true"},
+		{"palace needs shellcode or stager", map[string]any{"loader": "palace"}, nil, "shellcode=true or palace_stager=true"},
+		{"stager exclusive with shellcode", map[string]any{"loader": "palace", "shellcode": true, "palace_stager": true}, nil, "shellcode=false"},
+		{"stager needs palace", map[string]any{"palace_stager": true}, nil, "loader=palace"},
+		{"stager needs package none", map[string]any{"loader": "palace", "palace_stager": true, "package": "zip"}, nil, "package=none"},
+		{"stager needs sign none", map[string]any{"loader": "palace", "palace_stager": true, "sign": "self", "sign_domain": "x.example"}, nil, "sign=none"},
 		{"palace rejects x86", map[string]any{"loader": "palace", "shellcode": true, "arch": "x86"}, nil, "AMD_x64"},
 		{"palace trio needs native", map[string]any{"loader": "palace", "shellcode": true, "palace_hooks": true}, nil, "compiler=native"},
 		{"palace sleepmask needs native", map[string]any{"loader": "palace", "shellcode": true, "compiler": "go", "palace_sleepmask": true}, nil, "compiler=native"},
@@ -730,6 +745,28 @@ func TestBuildPalaceNativeTrio(t *testing.T) {
 	}
 	if resp.UpdatedFilename == nil || !strings.HasSuffix(*resp.UpdatedFilename, ".bin") {
 		t.Fatalf("filename wrong: %v", resp.UpdatedFilename)
+	}
+}
+
+func TestBuildPalaceStager(t *testing.T) {
+	t.Setenv("ERLIKHAN_OFFLINE", "1")
+	for _, tool := range []string{"go", "donut", "x86_64-w64-mingw32-gcc"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not installed", tool)
+		}
+	}
+	testServiceRoot(t)
+	msg := testBuildMessage("none", "")
+	bp := testBuildParams()
+	bp.Parameters["loader"] = "palace"
+	bp.Parameters["palace_stager"] = true
+	msg.BuildParameters = *bp
+	resp := build(msg)
+	assertPE(t, resp, ".exe")
+	// The stager embeds the whole palace blob, so it dwarfs the
+	// loader alone (~3KB) and the inner agent EXE.
+	if len(*resp.Payload) < 50000 {
+		t.Fatalf("stager suspiciously small: %d bytes", len(*resp.Payload))
 	}
 }
 

