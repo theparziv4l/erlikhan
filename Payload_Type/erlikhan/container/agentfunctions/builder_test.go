@@ -15,8 +15,11 @@ import (
 
 func testBuildParams() *agentstructs.BuildParameters {
 	p := map[string]any{}
-	for _, b := range []string{"garble", "console", "obfu_strings", "obfu_deadcode", "obfu_opaque", "obfu_mba", "obfu_controlflow", "obfu_winapi", "strip", "rename_sections", "pe_stomp", "sanitize", "iso_autorun", "shellcode"} {
+	for _, b := range []string{"garble", "console", "obfu_strings", "obfu_deadcode", "obfu_opaque", "obfu_mba", "obfu_controlflow", "obfu_winapi", "strip", "rename_sections", "pe_stomp", "sanitize", "iso_autorun", "shellcode", "palace_cfg", "palace_hooks", "palace_sleepmask", "palace_spoof"} {
 		p[b] = false
+	}
+	for _, b := range []string{"palace_ror13", "palace_no_rwx", "palace_cleanup", "palace_xor"} {
+		p[b] = true
 	}
 	p["garble_profile"] = "random"
 	p["arch"] = "AMD_x64"
@@ -27,6 +30,11 @@ func testBuildParams() *agentstructs.BuildParameters {
 	p["pack"] = "none"
 	p["sign"] = "none"
 	p["package"] = "none"
+	p["loader"] = "donut"
+	p["palace_pico"] = "stub"
+	p["palace_mask_len"] = 128.0
+	p["palace_inject"] = "self"
+	p["palace_hosts"] = ""
 	p["retries"] = 3.0
 	p["tasking_size"] = -1.0
 	p["sign_domain"] = ""
@@ -168,6 +176,35 @@ func TestParseBuildParams(t *testing.T) {
 	}
 }
 
+func TestParseBuildParamsPalace(t *testing.T) {
+	bp := testBuildParams()
+	bp.Parameters["loader"] = "palace"
+	bp.Parameters["shellcode"] = true
+	opts, err := parseBuildParams(bp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.loader != "palace" || !opts.palaceROR13 || !opts.palaceNoRWX || !opts.palaceCleanup ||
+		!opts.palaceXOR || opts.palacePICO != "stub" || opts.palaceMaskLen != 128 ||
+		opts.palaceInject != "self" || opts.palaceHosts != defaultPalaceHosts {
+		t.Fatalf("palace defaults mismatch: %+v", opts)
+	}
+	// Native trio parses; hosts override sticks.
+	bp = testBuildParams()
+	bp.Parameters["loader"] = "palace"
+	bp.Parameters["shellcode"] = true
+	bp.Parameters["compiler"] = "native"
+	bp.Parameters["palace_hooks"] = true
+	bp.Parameters["palace_sleepmask"] = true
+	bp.Parameters["palace_spoof"] = true
+	bp.Parameters["palace_inject"] = "host"
+	bp.Parameters["palace_hosts"] = "notepad.exe"
+	bp.Parameters["palace_mask_len"] = 64.0
+	if _, err := parseBuildParams(bp); err != nil {
+		t.Fatalf("native trio: %v", err)
+	}
+}
+
 func TestDonutArch(t *testing.T) {
 	if donutArch("AMD_x64") != "2" || donutArch("x86") != "1" {
 		t.Fatal("donut arch mapping wrong")
@@ -206,6 +243,17 @@ func TestParseBuildParamsRejects(t *testing.T) {
 		{"autorun needs iso", map[string]any{"iso_autorun": true}, nil, "iso_autorun"},
 		{"shellcode needs package none", map[string]any{"shellcode": true, "package": "zip"}, nil, "package=none"},
 		{"shellcode needs sign none", map[string]any{"shellcode": true, "sign": "self", "sign_domain": "x.example"}, nil, "sign=none"},
+		{"bad loader", map[string]any{"loader": "scarecrow"}, nil, "loader"},
+		{"palace needs shellcode", map[string]any{"loader": "palace"}, nil, "shellcode=true"},
+		{"palace rejects x86", map[string]any{"loader": "palace", "shellcode": true, "arch": "x86"}, nil, "AMD_x64"},
+		{"palace trio needs native", map[string]any{"loader": "palace", "shellcode": true, "palace_hooks": true}, nil, "compiler=native"},
+		{"palace sleepmask needs native", map[string]any{"loader": "palace", "shellcode": true, "compiler": "go", "palace_sleepmask": true}, nil, "compiler=native"},
+		{"palace spoof needs native", map[string]any{"loader": "palace", "shellcode": true, "compiler": "go", "palace_spoof": true}, nil, "compiler=native"},
+		{"trio needs palace", map[string]any{"palace_spoof": true}, nil, "loader=palace"},
+		{"host inject needs palace", map[string]any{"palace_inject": "host"}, nil, "loader=palace"},
+		{"bad mask len", map[string]any{"palace_mask_len": 8.0}, nil, "palace_mask_len"},
+		{"bad pico", map[string]any{"palace_pico": "full"}, nil, "palace_pico"},
+		{"bad inject", map[string]any{"palace_inject": "thread"}, nil, "palace_inject"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -619,6 +667,66 @@ func TestBuildShellcode(t *testing.T) {
 	// Raw shellcode: no MZ header, so service_wrapper accepts it.
 	if (*resp.Payload)[0] == 'M' && (*resp.Payload)[1] == 'Z' {
 		t.Fatal("shellcode output still has an MZ header")
+	}
+	if resp.UpdatedFilename == nil || !strings.HasSuffix(*resp.UpdatedFilename, ".bin") {
+		t.Fatalf("filename wrong: %v", resp.UpdatedFilename)
+	}
+}
+
+func TestBuildPalaceShellcode(t *testing.T) {
+	t.Setenv("ERLIKHAN_OFFLINE", "1")
+	for _, tool := range []string{"go", "donut", "x86_64-w64-mingw32-gcc"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not installed", tool)
+		}
+	}
+	testServiceRoot(t)
+	msg := testBuildMessage("none", "")
+	bp := testBuildParams()
+	bp.Parameters["shellcode"] = true
+	bp.Parameters["loader"] = "palace"
+	msg.BuildParameters = *bp
+	resp := build(msg)
+	if !resp.Success {
+		t.Fatalf("build failed: %s %s", resp.BuildMessage, resp.BuildStdErr)
+	}
+	// Palace wraps the Donut output, so it is bigger than Donut alone.
+	if resp.Payload == nil || len(*resp.Payload) < 50000 {
+		t.Fatalf("palace output suspiciously small: %d bytes", len(*resp.Payload))
+	}
+	if (*resp.Payload)[0] == 'M' && (*resp.Payload)[1] == 'Z' {
+		t.Fatal("palace output still has an MZ header")
+	}
+	if resp.UpdatedFilename == nil || !strings.HasSuffix(*resp.UpdatedFilename, ".bin") {
+		t.Fatalf("filename wrong: %v", resp.UpdatedFilename)
+	}
+}
+
+func TestBuildPalaceNativeTrio(t *testing.T) {
+	t.Setenv("ERLIKHAN_OFFLINE", "1")
+	for _, tool := range []string{"go", "zig", "donut", "x86_64-w64-mingw32-gcc"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not installed", tool)
+		}
+	}
+	testServiceRoot(t)
+	msg := testBuildMessage("none", "")
+	bp := testBuildParams()
+	bp.Parameters["shellcode"] = true
+	bp.Parameters["loader"] = "palace"
+	bp.Parameters["compiler"] = "native"
+	bp.Parameters["palace_hooks"] = true
+	bp.Parameters["palace_sleepmask"] = true
+	bp.Parameters["palace_spoof"] = true
+	bp.Parameters["palace_cfg"] = true
+	bp.Parameters["palace_inject"] = "host"
+	msg.BuildParameters = *bp
+	resp := build(msg)
+	if !resp.Success {
+		t.Fatalf("build failed: %s %s", resp.BuildMessage, resp.BuildStdErr)
+	}
+	if resp.Payload == nil || (*resp.Payload)[0] == 'M' && (*resp.Payload)[1] == 'Z' {
+		t.Fatal("palace output has an MZ header")
 	}
 	if resp.UpdatedFilename == nil || !strings.HasSuffix(*resp.UpdatedFilename, ".bin") {
 		t.Fatalf("filename wrong: %v", resp.UpdatedFilename)

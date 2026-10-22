@@ -5,6 +5,7 @@ FROM itsafeaturemythic/mythic_go_base:latest
 # zig cross-compiles the native C agent (compiler=native).
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	osslsigncode \
+	mingw-w64 \
 	genisoimage \
 	dosfstools \
 	mtools \

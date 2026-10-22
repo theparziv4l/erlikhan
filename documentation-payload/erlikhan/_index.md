@@ -87,6 +87,20 @@ Every option that applies to an agent build is a build parameter:
 | retries | Number | 3 | Checkin attempts |
 | tasking_size | Number | -1 | Tasks per poll (-1 = all) |
 | shellcode | Boolean | false | Raw shellcode (.bin) via Donut; needs package=none, sign=none |
+| loader | ChooseOne | donut | donut (raw output) / palace (PIC loader wrapper) |
+| palace_ror13 | Boolean | true | Palace: ROR13 PEB-walk API resolution, zero IAT |
+| palace_no_rwx | Boolean | true | Palace: RW staging then RX, never RWX |
+| palace_cfg | Boolean | false | Palace: register regions as valid CFG targets |
+| palace_cleanup | Boolean | true | Palace: zero shellcode pages before freeing |
+| palace_pico | ChooseOne | stub | Palace: PICO tag-dispatch stub / none |
+| palace_xor | Boolean | true | Palace: XOR-encrypt embedded shellcode |
+| palace_mask_len | Number | 128 | Palace: random XOR mask length (16-512) |
+| palace_hooks | Boolean | false | Palace: IAT hooks (native only) |
+| palace_sleepmask | Boolean | false | Palace: XOR sleep masking (native only) |
+| palace_spoof | Boolean | false | Palace: call-stack spoofing (native only) |
+| palace_inject | ChooseOne | self | Palace: run in self / inject sacrificial host |
+| palace_hosts | String | — | Palace: host fallback order (default RuntimeBroker,SgrmBroker,WerFault,dllhost,notepad) |
+| palace_spec | File | — | Palace: custom spec file override |
 | package | ChooseOne | none | none / zip / iso / img / vhd / 7z / msi |
 | package_password | String | — | 7z password |
 | msi_app_name | String | — | MSI product name |
@@ -207,6 +221,40 @@ the build requires `sign=none` and `package=none` with it. The `.bin`
 is accepted by `service_wrapper` (select the built payload as the
 wrapped payload when creating the wrapper) and by external loaders
 such as ScareCrow.
+
+## Palace loader
+
+With `shellcode=true` and `loader=palace` (AMD_x64 only) the Donut
+shellcode is wrapped in a Crystal Palace style PIC loader: a flat blob
+with no PE headers and no IAT, entered at offset 0. Each technique is
+a separate `palace_*` option:
+
+- `palace_ror13`: APIs resolved at runtime via a PEB walk hashed with
+  ROR13 (no import strings); off compares plaintext names instead.
+- `palace_no_rwx`: payload and PICO regions are staged RW then
+  protected RX; off uses single RWX mappings for comparison.
+- `palace_xor` / `palace_mask_len`: the shellcode is embedded
+  XOR-encrypted with a random mask (`dll`/`mask` resource sections).
+- `palace_pico`: PICO tag-dispatch stub (`setup_hooks`,
+  `setup_memory`); `none` skips it.
+- `palace_cfg`: registers loader regions with Control Flow Guard.
+- `palace_cleanup`: zeroes shellcode pages before freeing.
+- `palace_inject=host` / `palace_hosts`: injects a sacrificial host
+  (fallback order, spawning suspended notepad last) instead of
+  running in-process; the loader then exits.
+- `palace_hooks`, `palace_sleepmask`, `palace_spoof`: IAT hooks
+  (ExitThread wipes the shellcode region), suspend-mask-sleep-unmask
+  joining, and call-stack spoofing. Native only: Go's preemptive
+  scheduler breaks all three, so they are rejected with
+  `compiler=go` (same reason the Sliver port stubs them).
+- `palace_spec`: uploaded spec file replacing the default DSL.
+
+Notes: the blob mixes code with writable globals, so deliver it in an
+RWX mapping like any injector; the no-RWX guarantee covers the
+loader's own payload/PICO allocations. Sleep masking suspends every
+other thread in the process while masked and fails safe to a plain
+join. Stack spoofing overwrites validated caller frames with an ntdll
+RET gadget and always restores before returning.
 
 ## Adding or removing commands
 

